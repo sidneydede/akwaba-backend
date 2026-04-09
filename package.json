@@ -4,7 +4,7 @@
   "description": "Backend API Akwaba - Billetterie événementielle Côte d'Ivoire",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "npm run setup && node server.js",
     "dev": "node server.js",
     "migrate": "node db/migrate.js",
     "seed": "node db/seed.js",

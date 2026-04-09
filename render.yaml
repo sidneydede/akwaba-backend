@@ -9,7 +9,7 @@ services:
     name: akwaba-backend
     runtime: node
     plan: free
-    buildCommand: npm install && npm run setup
+    buildCommand: npm install
     startCommand: npm start
     envVars:
       - key: DATABASE_URL
