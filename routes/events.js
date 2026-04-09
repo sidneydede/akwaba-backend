@@ -56,6 +56,40 @@ router.get('/', function(req, res) {
     });
 });
 
+// GET /events/mine — Liste les événements créés par l'organisateur connecté
+router.get('/mine', auth.authMiddleware, function(req, res) {
+  pool.query(
+    'SELECT id, title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes, created_at FROM events WHERE organizer_id = $1 ORDER BY created_at DESC',
+    [req.userId]
+  )
+    .then(function(result) {
+      var events = result.rows.map(function(row) {
+        return {
+          id: row.id.toString(),
+          title: row.title,
+          description: row.description,
+          category: row.category,
+          date: row.date,
+          lieu: row.lieu,
+          prix: row.prix_display,
+          prix_num: row.prix,
+          emoji: row.emoji,
+          color: row.color,
+          chaud: row.chaud,
+          image_url: row.image_url,
+          places_total: row.places_total,
+          places_restantes: row.places_restantes,
+          created_at: row.created_at
+        };
+      });
+      res.json({ success: true, events: events });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /events/mine:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // GET /events/:id — Détail d'un événement
 router.get('/:id', function(req, res) {
   pool.query('SELECT * FROM events WHERE id = $1', [req.params.id])
