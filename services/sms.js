@@ -44,10 +44,16 @@ function sendOtp(phone, code) {
   }
 
   // Mode prod : appel HTTP à Africa's Talking
+  // ⚠️ En sandbox, ne PAS envoyer le paramètre `from` : les sender IDs
+  // personnalisés ne sont pas autorisés en sandbox et le SMS est rejeté.
+  // En production, on utilise AT_SENDER_ID (doit être pré-approuvé par AT).
+  var isSandbox = AT_USERNAME === 'sandbox';
   var formBody = 'username=' + encodeURIComponent(AT_USERNAME) +
     '&to=' + encodeURIComponent(normalized) +
-    '&from=' + encodeURIComponent(AT_SENDER_ID) +
     '&message=' + encodeURIComponent(message);
+  if (!isSandbox) {
+    formBody += '&from=' + encodeURIComponent(AT_SENDER_ID);
+  }
 
   return fetch(AT_URL, {
     method: 'POST',
