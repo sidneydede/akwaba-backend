@@ -19,13 +19,14 @@ function isRealSmsEnabled() {
   return Boolean(AT_USERNAME && AT_API_KEY);
 }
 
-// Normalise un numéro ivoirien au format international +225XXXXXXXX
+// Normalise un numéro ivoirien au format international +225XXXXXXXXXX
+// ⚠️ Depuis 2021, les numéros ivoiriens font 10 chiffres et le 0 initial
+// fait partie du numéro (ne pas le supprimer). Format final : +225 + 10 chiffres.
 // @param {string} phone - Numéro local (ex: 0700000000) ou international
-// @returns {string} Numéro au format +225XXXXXXXXXX
+// @returns {string} Numéro au format +225XXXXXXXXXX (13 caractères au total)
 function normalizePhone(phone) {
   var clean = phone.replace(/\s/g, '').replace(/^\+/, '');
   if (clean.startsWith('225')) return '+' + clean;
-  if (clean.startsWith('0')) return '+225' + clean.substring(1);
   return '+225' + clean;
 }
 
