@@ -56,8 +56,30 @@ function authMiddleware(req, res, next) {
   next();
 }
 
+// Vérifie que l'utilisateur authentifié est un organisateur
+// À chaîner après authMiddleware. Pose req.user = { id, nom, prenom, phone, role }.
+function requireOrganizer(req, res, next) {
+  pool.query('SELECT id, nom, prenom, phone, role FROM users WHERE id = $1', [req.userId])
+    .then(function(result) {
+      if (result.rows.length === 0) {
+        return res.status(401).json({ success: false, message: 'Utilisateur introuvable' });
+      }
+      var user = result.rows[0];
+      if (user.role !== 'organisateur') {
+        return res.status(403).json({ success: false, message: 'Réservé aux organisateurs' });
+      }
+      req.user = user;
+      next();
+    })
+    .catch(function(err) {
+      console.error('Erreur requireOrganizer:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+}
+
 module.exports = {
   generateToken: generateToken,
   decodeToken: decodeToken,
-  authMiddleware: authMiddleware
+  authMiddleware: authMiddleware,
+  requireOrganizer: requireOrganizer
 };
