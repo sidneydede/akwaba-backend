@@ -68,11 +68,23 @@ CREATE TABLE IF NOT EXISTS payments (\n\
   updated_at TIMESTAMP DEFAULT NOW()\n\
 );\n\
 \n\
+-- Table des tokens push (un user peut avoir plusieurs devices)\n\
+CREATE TABLE IF NOT EXISTS device_tokens (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  token TEXT NOT NULL,\n\
+  platform VARCHAR(20),\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  last_seen_at TIMESTAMP DEFAULT NOW(),\n\
+  UNIQUE (user_id, token)\n\
+);\n\
+\n\
 -- Index pour les requêtes fréquentes\n\
 CREATE INDEX IF NOT EXISTS idx_bookings_user ON bookings(user_id);\n\
 CREATE INDEX IF NOT EXISTS idx_bookings_event ON bookings(event_id);\n\
 CREATE INDEX IF NOT EXISTS idx_events_category ON events(category);\n\
 CREATE INDEX IF NOT EXISTS idx_payments_transaction ON payments(transaction_id);\n\
+CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);\n\
 ";
 
 console.log('Migration en cours...');
@@ -84,6 +96,7 @@ pool.query(CREATE_TABLES)
     console.log('  - events');
     console.log('  - bookings');
     console.log('  - payments');
+    console.log('  - device_tokens');
     process.exit(0);
   })
   .catch(function(err) {

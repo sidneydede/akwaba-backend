@@ -4,6 +4,34 @@
 var express = require('express');
 var router = express.Router();
 var pool = require('../db/pool');
+var push = require('../services/push');
+
+// Notifie participant + organisateur quand un booking est confirmé via webhook
+// (factorisé pour éviter la duplication avec routes/bookings.js).
+function notifyBookingConfirmed(bookingId) {
+  pool.query(
+    'SELECT b.id, b.ref, b.quantity, b.user_id, e.id AS event_id, e.title, e.organizer_id ' +
+    'FROM bookings b JOIN events e ON b.event_id = e.id WHERE b.id = $1',
+    [bookingId]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) return;
+      var b = result.rows[0];
+      push.notifyUser(b.user_id, {
+        title: 'Billet confirmé 🎟️',
+        body: '« ' + b.title + ' » — réf ' + b.ref + (b.quantity > 1 ? ' (' + b.quantity + ' places)' : ''),
+        data: { type: 'booking_confirmed', bookingId: b.id.toString(), eventId: b.event_id.toString() }
+      });
+      if (b.organizer_id && b.organizer_id !== b.user_id) {
+        push.notifyUser(b.organizer_id, {
+          title: 'Nouvelle vente 💰',
+          body: b.quantity + ' billet' + (b.quantity > 1 ? 's' : '') + ' vendu' + (b.quantity > 1 ? 's' : '') + ' sur « ' + b.title + ' »',
+          data: { type: 'sale', bookingId: b.id.toString(), eventId: b.event_id.toString() }
+        });
+      }
+    })
+    .catch(function(err) { console.error('Erreur notifyBookingConfirmed (webhook):', err.message); });
+}
 
 // POST /payments/notify — Webhook CinetPay
 // CinetPay envoie une notification quand le paiement est traité
@@ -29,10 +57,13 @@ router.post('/notify', function(req, res) {
       // Si le paiement est accepté, confirme la réservation associée
       if (status === 'ACCEPTED' || status === '00') {
         return pool.query(
-          "UPDATE bookings SET statut = 'confirme', transaction_id = $1, updated_at = NOW() WHERE transaction_id = $1 OR ref = $1",
+          "UPDATE bookings SET statut = 'confirme', transaction_id = $1, updated_at = NOW() WHERE transaction_id = $1 OR ref = $1 RETURNING id",
           [transactionId]
         )
-          .then(function() {
+          .then(function(updateResult) {
+            updateResult.rows.forEach(function(row) {
+              notifyBookingConfirmed(row.id);
+            });
             res.json({ success: true, message: 'Paiement enregistré et réservation confirmée' });
           });
       }

@@ -10,6 +10,7 @@ var authRoutes = require('./routes/auth');
 var eventsRoutes = require('./routes/events');
 var bookingsRoutes = require('./routes/bookings');
 var paymentsRoutes = require('./routes/payments');
+var devicesRoutes = require('./routes/devices');
 
 var app = express();
 var PORT = process.env.PORT || 3000;
@@ -32,6 +33,7 @@ app.use('/auth', authRoutes);
 app.use('/events', eventsRoutes);
 app.use('/bookings', bookingsRoutes);
 app.use('/payments', paymentsRoutes);
+app.use('/devices', devicesRoutes);
 
 // Démarrage du serveur
 app.listen(PORT, function() {

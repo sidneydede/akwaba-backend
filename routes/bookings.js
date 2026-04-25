@@ -6,6 +6,43 @@ var router = express.Router();
 var crypto = require('crypto');
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
+var push = require('../services/push');
+
+// Envoie les notifications "billet confirmé" au participant et à l'organisateur.
+// Appelé après qu'un booking passe en statut 'confirme'. N'attend pas le résultat
+// (fire-and-forget) pour ne pas ralentir la réponse HTTP.
+// @param {number|string} bookingId
+function notifyBookingConfirmed(bookingId) {
+  pool.query(
+    'SELECT b.id, b.ref, b.quantity, b.total_amount, b.user_id, ' +
+    'e.id AS event_id, e.title, e.organizer_id ' +
+    'FROM bookings b JOIN events e ON b.event_id = e.id WHERE b.id = $1',
+    [bookingId]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) return;
+      var b = result.rows[0];
+
+      // Notif au participant
+      push.notifyUser(b.user_id, {
+        title: 'Billet confirmé 🎟️',
+        body: '« ' + b.title + ' » — réf ' + b.ref + (b.quantity > 1 ? ' (' + b.quantity + ' places)' : ''),
+        data: { type: 'booking_confirmed', bookingId: b.id.toString(), eventId: b.event_id.toString() }
+      });
+
+      // Notif à l'organisateur (si différent du participant)
+      if (b.organizer_id && b.organizer_id !== b.user_id) {
+        push.notifyUser(b.organizer_id, {
+          title: 'Nouvelle vente 💰',
+          body: b.quantity + ' billet' + (b.quantity > 1 ? 's' : '') + ' vendu' + (b.quantity > 1 ? 's' : '') + ' sur « ' + b.title + ' »',
+          data: { type: 'sale', bookingId: b.id.toString(), eventId: b.event_id.toString() }
+        });
+      }
+    })
+    .catch(function(err) {
+      console.error('Erreur notifyBookingConfirmed:', err.message);
+    });
+}
 
 // Génère une référence unique pour le billet
 // @returns {string} Référence au format AKW-XXXXXXXX
@@ -138,6 +175,8 @@ router.patch('/:id/confirm', function(req, res) {
       if (result.rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Réservation non trouvée' });
       }
+
+      notifyBookingConfirmed(result.rows[0].id);
 
       res.json({
         success: true,
