@@ -85,6 +85,10 @@ CREATE INDEX IF NOT EXISTS idx_bookings_event ON bookings(event_id);\n\
 CREATE INDEX IF NOT EXISTS idx_events_category ON events(category);\n\
 CREATE INDEX IF NOT EXISTS idx_payments_transaction ON payments(transaction_id);\n\
 CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);\n\
+\n\
+-- Géolocalisation : coordonnées d'un événement (idempotent sur redeploy)\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS latitude DECIMAL(9,6);\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS longitude DECIMAL(9,6);\n\
 ";
 
 console.log('Migration en cours...');

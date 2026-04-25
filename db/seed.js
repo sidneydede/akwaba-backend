@@ -14,8 +14,9 @@ ON CONFLICT (phone) DO NOTHING;\
 ";
 
 // Événements de test (mêmes que l'API actuelle + nouveaux)
+// Coordonnées Abidjan/Bouaké pour tester la géolocalisation.
 var INSERT_EVENTS = "\
-INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, places_total, places_restantes) VALUES \
+INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, places_total, places_restantes, latitude, longitude) VALUES \
 (\
   'FEMUA 2025', \
   'Le Festival des Musiques Urbaines d''Anoumabo, l''un des plus grands festivals de musique en Afrique de l''Ouest. Artistes internationaux, ambiance électrique et culture ivoirienne à son meilleur.', \
@@ -28,7 +29,9 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
   '#E67E22', \
   true, \
   5000, \
-  4753 \
+  4753, \
+  5.281, \
+  -3.987 \
 ), \
 (\
   'Match ASEC vs Africa', \
@@ -42,7 +45,9 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
   '#C0392B', \
   false, \
   20000, \
-  18500 \
+  18500, \
+  7.690, \
+  -5.030 \
 ), \
 (\
   'Nuit du Coupé-Décalé', \
@@ -56,7 +61,9 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
   '#B8860B', \
   true, \
   800, \
-  752 \
+  752, \
+  5.358, \
+  -3.985 \
 ), \
 (\
   'Stand-up Abidjan Comedy', \
@@ -70,7 +77,9 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
   '#922B21', \
   false, \
   1200, \
-  1150 \
+  1150, \
+  5.317, \
+  -4.013 \
 ), \
 (\
   'Africa Digital Summit', \
@@ -84,7 +93,9 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
   '#2980B9', \
   true, \
   500, \
-  420 \
+  420, \
+  5.330, \
+  -3.999 \
 ), \
 (\
   'Veillée de Prière - Cathédrale', \
@@ -98,9 +109,22 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
   '#27AE60', \
   false, \
   2000, \
-  1800 \
+  1800, \
+  5.330, \
+  -4.018 \
 ) \
 ON CONFLICT DO NOTHING;\
+";
+
+// Backfill des coordonnées pour les events seedés sur une DB pré-existante
+// (ne fait rien si la colonne latitude est déjà renseignée). Idempotent.
+var BACKFILL_COORDS = "\
+UPDATE events SET latitude = 5.281, longitude = -3.987 WHERE title = 'FEMUA 2025' AND latitude IS NULL;\
+UPDATE events SET latitude = 7.690, longitude = -5.030 WHERE title = 'Match ASEC vs Africa' AND latitude IS NULL;\
+UPDATE events SET latitude = 5.358, longitude = -3.985 WHERE title = 'Nuit du Coupé-Décalé' AND latitude IS NULL;\
+UPDATE events SET latitude = 5.317, longitude = -4.013 WHERE title = 'Stand-up Abidjan Comedy' AND latitude IS NULL;\
+UPDATE events SET latitude = 5.330, longitude = -3.999 WHERE title = 'Africa Digital Summit' AND latitude IS NULL;\
+UPDATE events SET latitude = 5.330, longitude = -4.018 WHERE title = 'Veillée de Prière - Cathédrale' AND latitude IS NULL;\
 ";
 
 console.log('Seed en cours...');
@@ -112,6 +136,10 @@ pool.query(INSERT_USER)
   })
   .then(function() {
     console.log('Événements de test créés');
+    return pool.query(BACKFILL_COORDS);
+  })
+  .then(function() {
+    console.log('Coordonnées géo backfillées (events pré-existants sans lat/lng)');
     console.log('Seed terminé avec succès !');
     process.exit(0);
   })

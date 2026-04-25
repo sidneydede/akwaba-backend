@@ -9,28 +9,67 @@ var auth = require('../middleware/auth');
 // GET /events — Liste tous les événements
 // @query {string} category - Filtrer par catégorie (optionnel)
 // @query {string} search - Recherche texte (optionnel)
+// @query {number} lat - Latitude utilisateur pour calcul de distance (optionnel)
+// @query {number} lng - Longitude utilisateur (requis si lat fourni)
+// @query {number} distance_km - Filtre par rayon en km (requiert lat+lng)
+//
+// Calcul de distance : formule de Haversine en SQL pur (rayon Terre 6371 km).
+// Pas d'index spatial nécessaire (~50-200 events, full scan négligeable).
+// Si distance_km fourni : exclut les events sans coords (latitude IS NULL),
+// trie par distance ASC. Sinon : tri par défaut (chaud DESC, created_at DESC).
 router.get('/', function(req, res) {
   var category = req.query.category;
   var search = req.query.search;
+  var lat = req.query.lat !== undefined ? parseFloat(req.query.lat) : null;
+  var lng = req.query.lng !== undefined ? parseFloat(req.query.lng) : null;
+  var distanceKm = req.query.distance_km !== undefined ? parseFloat(req.query.distance_km) : null;
 
-  var query = 'SELECT id, title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes FROM events ORDER BY chaud DESC, created_at DESC';
+  var hasGeo = lat !== null && !isNaN(lat) && lng !== null && !isNaN(lng);
+  var hasDistanceFilter = hasGeo && distanceKm !== null && !isNaN(distanceKm);
+
   var params = [];
+  var distanceExpr = '';
+  if (hasGeo) {
+    params.push(lat); // $1
+    params.push(lng); // $2
+    // LEAST(1, GREATEST(-1, ...)) clampe pour éviter ACOS de valeurs hors [-1,1]
+    // dues aux erreurs flottantes (ex: même point → cos*cos+sin*sin légèrement > 1)
+    distanceExpr = '(6371 * acos(LEAST(1, GREATEST(-1, ' +
+      'cos(radians($1)) * cos(radians(latitude)) * cos(radians(longitude) - radians($2)) + ' +
+      'sin(radians($1)) * sin(radians(latitude))' +
+      '))))';
+  }
 
+  var selectCols = 'id, title, description, category, date, lieu, prix, prix_display, ' +
+    'emoji, color, chaud, image_url, places_total, places_restantes, latitude, longitude';
+  if (hasGeo) selectCols += ', ' + distanceExpr + ' AS distance_km';
+
+  var clauses = [];
+  if (hasDistanceFilter) clauses.push('latitude IS NOT NULL AND longitude IS NOT NULL');
   if (category) {
-    query = 'SELECT id, title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes FROM events WHERE LOWER(category) = LOWER($1) ORDER BY chaud DESC, created_at DESC';
-    params = [category];
+    params.push(category);
+    clauses.push('LOWER(category) = LOWER($' + params.length + ')');
   }
-
   if (search) {
-    query = 'SELECT id, title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes FROM events WHERE LOWER(title) LIKE LOWER($1) OR LOWER(lieu) LIKE LOWER($1) ORDER BY chaud DESC, created_at DESC';
-    params = ['%' + search + '%'];
+    params.push('%' + search + '%');
+    clauses.push('(LOWER(title) LIKE LOWER($' + params.length + ') OR LOWER(lieu) LIKE LOWER($' + params.length + '))');
   }
 
-  pool.query(query, params)
+  var sql = 'SELECT ' + selectCols + ' FROM events';
+  if (clauses.length > 0) sql += ' WHERE ' + clauses.join(' AND ');
+
+  if (hasDistanceFilter) {
+    // Sous-requête : Postgres n'autorise pas l'alias distance_km dans WHERE/ORDER BY direct
+    params.push(distanceKm);
+    sql = 'SELECT * FROM (' + sql + ') sub WHERE distance_km <= $' + params.length + ' ORDER BY distance_km ASC';
+  } else {
+    sql += ' ORDER BY chaud DESC, created_at DESC';
+  }
+
+  pool.query(sql, params)
     .then(function(result) {
-      // Format compatible avec le frontend existant
       var events = result.rows.map(function(row) {
-        return {
+        var ev = {
           id: row.id.toString(),
           title: row.title,
           description: row.description,
@@ -44,8 +83,14 @@ router.get('/', function(req, res) {
           chaud: row.chaud,
           image_url: row.image_url,
           places_total: row.places_total,
-          places_restantes: row.places_restantes
+          places_restantes: row.places_restantes,
+          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null
         };
+        if (row.distance_km !== undefined && row.distance_km !== null) {
+          ev.distance_km = parseFloat(row.distance_km);
+        }
+        return ev;
       });
 
       res.json({ success: true, events: events });
@@ -61,7 +106,8 @@ router.get('/', function(req, res) {
 router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
   pool.query(
     'SELECT e.id, e.title, e.description, e.category, e.date, e.lieu, e.prix, e.prix_display, ' +
-    'e.emoji, e.color, e.chaud, e.image_url, e.places_total, e.places_restantes, e.created_at, ' +
+    'e.emoji, e.color, e.chaud, e.image_url, e.places_total, e.places_restantes, ' +
+    'e.latitude, e.longitude, e.created_at, ' +
     '(e.places_total - e.places_restantes) AS places_vendues, ' +
     "COALESCE((SELECT SUM(total_amount) FROM bookings WHERE event_id = e.id AND statut = 'confirme'), 0) AS revenue " +
     'FROM events e WHERE e.organizer_id = $1 ORDER BY e.created_at DESC',
@@ -84,6 +130,8 @@ router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, re
           image_url: row.image_url,
           places_total: row.places_total,
           places_restantes: row.places_restantes,
+          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
           places_vendues: row.places_vendues,
           revenue: parseInt(row.revenue) || 0,
           created_at: row.created_at
@@ -123,6 +171,8 @@ router.get('/:id', function(req, res) {
           image_url: row.image_url,
           places_total: row.places_total,
           places_restantes: row.places_restantes,
+          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
           organizer_id: row.organizer_id
         }
       });
@@ -148,9 +198,15 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
   var prix = parseInt(body.prix) || 0;
   var prixDisplay = prix > 0 ? prix.toLocaleString('fr-FR') + ' FCFA' : 'Gratuit';
   var placesTotal = parseInt(body.places_total) || 500;
+  var latitude = body.latitude !== undefined && body.latitude !== null && body.latitude !== ''
+    ? parseFloat(body.latitude) : null;
+  var longitude = body.longitude !== undefined && body.longitude !== null && body.longitude !== ''
+    ? parseFloat(body.longitude) : null;
+  if (latitude !== null && isNaN(latitude)) latitude = null;
+  if (longitude !== null && isNaN(longitude)) longitude = null;
 
   pool.query(
-    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes, organizer_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13) RETURNING *',
+    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes, organizer_id, latitude, longitude) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15) RETURNING *',
     [
       body.title,
       body.description || '',
@@ -164,7 +220,9 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
       body.chaud || false,
       body.image_url || null,
       placesTotal,
-      req.userId
+      req.userId,
+      latitude,
+      longitude
     ]
   )
     .then(function(result) {
@@ -178,7 +236,9 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
           category: row.category,
           date: row.date,
           lieu: row.lieu,
-          prix: row.prix_display
+          prix: row.prix_display,
+          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null
         }
       });
     })
@@ -225,6 +285,19 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         newPlacesRestantes = newPlacesTotal - placesVendues;
       }
 
+      // Coords optionnelles. Pour effacer une coord, le client doit envoyer null
+      // explicitement (COALESCE garde l'ancienne si undefined → null côté JS).
+      var latitude = null;
+      if (body.latitude !== undefined && body.latitude !== null && body.latitude !== '') {
+        var parsedLat = parseFloat(body.latitude);
+        if (!isNaN(parsedLat)) latitude = parsedLat;
+      }
+      var longitude = null;
+      if (body.longitude !== undefined && body.longitude !== null && body.longitude !== '') {
+        var parsedLng = parseFloat(body.longitude);
+        if (!isNaN(parsedLng)) longitude = parsedLng;
+      }
+
       return pool.query(
         'UPDATE events SET ' +
         'title = COALESCE($1, title), ' +
@@ -240,8 +313,10 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         'image_url = COALESCE($11, image_url), ' +
         'places_total = COALESCE($12, places_total), ' +
         'places_restantes = COALESCE($13, places_restantes), ' +
+        'latitude = COALESCE($14, latitude), ' +
+        'longitude = COALESCE($15, longitude), ' +
         'updated_at = NOW() ' +
-        'WHERE id = $14 RETURNING *',
+        'WHERE id = $16 RETURNING *',
         [
           body.title || null,
           body.description !== undefined ? body.description : null,
@@ -256,6 +331,8 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
           body.image_url !== undefined ? body.image_url : null,
           newPlacesTotal,
           newPlacesRestantes,
+          latitude,
+          longitude,
           eventId
         ]
       )
@@ -278,7 +355,9 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
               chaud: row.chaud,
               image_url: row.image_url,
               places_total: row.places_total,
-              places_restantes: row.places_restantes
+              places_restantes: row.places_restantes,
+              latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+              longitude: row.longitude !== null ? parseFloat(row.longitude) : null
             }
           });
         });
