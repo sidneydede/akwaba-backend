@@ -116,6 +116,17 @@ INSERT INTO events (title, description, category, date, lieu, prix, prix_display
 ON CONFLICT DO NOTHING;\
 ";
 
+// Nettoie les doublons d'events seedés accumulés par les redeploys passés
+// (le seed était rerun à chaque cold start sans UNIQUE constraint efficace).
+// Garde le plus petit id par titre, sauf si un id plus grand a des bookings
+// (auquel cas on le garde aussi pour ne pas casser la contrainte FK).
+// Idempotent : ne fait rien si pas de doublons.
+var CLEANUP_DUPLICATES = "\
+DELETE FROM events \
+WHERE id NOT IN (SELECT MIN(id) FROM events GROUP BY title) \
+  AND id NOT IN (SELECT DISTINCT event_id FROM bookings WHERE event_id IS NOT NULL);\
+";
+
 // Backfill des coordonnées pour les events seedés sur une DB pré-existante
 // (ne fait rien si la colonne latitude est déjà renseignée). Idempotent.
 var BACKFILL_COORDS = "\
@@ -132,14 +143,31 @@ console.log('Seed en cours...');
 pool.query(INSERT_USER)
   .then(function() {
     console.log('Utilisateurs de test créés');
+    // Nettoyage des doublons accumulés par les redeploys passés.
+    return pool.query(CLEANUP_DUPLICATES);
+  })
+  .then(function(cleanupResult) {
+    if (cleanupResult.rowCount > 0) {
+      console.log('Doublons d\'events nettoyés : ' + cleanupResult.rowCount + ' row(s)');
+    }
+    // Skip INSERT_EVENTS si la table contient déjà des events (évite la
+    // recréation à chaque cold start). Le seed n'insère qu'une fois sur DB vide.
+    return pool.query('SELECT COUNT(*)::int AS n FROM events');
+  })
+  .then(function(countResult) {
+    var n = countResult.rows[0].n;
+    if (n > 0) {
+      console.log('Events déjà présents (' + n + '), skip INSERT seed');
+      return null;
+    }
+    console.log('Table events vide, insertion des events seed');
     return pool.query(INSERT_EVENTS);
   })
   .then(function() {
-    console.log('Événements de test créés');
     return pool.query(BACKFILL_COORDS);
   })
   .then(function() {
-    console.log('Coordonnées géo backfillées (events pré-existants sans lat/lng)');
+    console.log('Coordonnées géo backfillées (events sans lat/lng)');
     console.log('Seed terminé avec succès !');
     process.exit(0);
   })
