@@ -89,6 +89,38 @@ CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(user_id);\n\
 -- Géolocalisation : coordonnées d'un événement (idempotent sur redeploy)\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS latitude DECIMAL(9,6);\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS longitude DECIMAL(9,6);\n\
+\n\
+-- Admin / modération (idempotent sur redeploy)\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMP;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS suspended_reason TEXT;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(200);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;\n\
+\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending';\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS moderated_by INTEGER REFERENCES users(id);\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS moderated_at TIMESTAMP;\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS rejection_reason TEXT;\n\
+\n\
+-- Backfill : tous les events pré-existants passent à 'approved' pour ne pas\n\
+-- disparaître de l'app. Les nouveaux events partent à 'pending' (DEFAULT).\n\
+UPDATE events SET status = 'approved' WHERE status IS NULL;\n\
+\n\
+-- Audit log : trace toutes les actions admin (qui, quoi, quand, sur quelle cible)\n\
+CREATE TABLE IF NOT EXISTS admin_audit_log (\n\
+  id SERIAL PRIMARY KEY,\n\
+  admin_id INTEGER REFERENCES users(id),\n\
+  action VARCHAR(50) NOT NULL,\n\
+  target_type VARCHAR(20),\n\
+  target_id VARCHAR(50),\n\
+  metadata JSONB,\n\
+  created_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+\n\
+CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);\n\
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);\n\
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);\n\
+CREATE INDEX IF NOT EXISTS idx_admin_audit_admin ON admin_audit_log(admin_id, created_at DESC);\n\
 ";
 
 console.log('Migration en cours...');
@@ -101,6 +133,7 @@ pool.query(CREATE_TABLES)
     console.log('  - bookings');
     console.log('  - payments');
     console.log('  - device_tokens');
+    console.log('  - admin_audit_log');
     process.exit(0);
   })
   .catch(function(err) {

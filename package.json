@@ -8,6 +8,7 @@
     "dev": "node server.js",
     "migrate": "node db/migrate.js",
     "seed": "node db/seed.js",
+    "seed:admin": "node scripts/seed-admin.js",
     "setup": "node db/migrate.js && node db/seed.js"
   },
   "dependencies": {

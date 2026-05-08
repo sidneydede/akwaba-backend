@@ -45,6 +45,8 @@ router.get('/', function(req, res) {
   if (hasGeo) selectCols += ', ' + distanceExpr + ' AS distance_km';
 
   var clauses = [];
+  // Catalogue public : ne montre que les events validés par modération admin.
+  clauses.push("status = 'approved'");
   if (hasDistanceFilter) clauses.push('latitude IS NOT NULL AND longitude IS NOT NULL');
   if (category) {
     params.push(category);
@@ -107,7 +109,7 @@ router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, re
   pool.query(
     'SELECT e.id, e.title, e.description, e.category, e.date, e.lieu, e.prix, e.prix_display, ' +
     'e.emoji, e.color, e.chaud, e.image_url, e.places_total, e.places_restantes, ' +
-    'e.latitude, e.longitude, e.created_at, ' +
+    'e.latitude, e.longitude, e.created_at, e.status, e.rejection_reason, ' +
     '(e.places_total - e.places_restantes) AS places_vendues, ' +
     "COALESCE((SELECT SUM(total_amount) FROM bookings WHERE event_id = e.id AND statut = 'confirme'), 0) AS revenue " +
     'FROM events e WHERE e.organizer_id = $1 ORDER BY e.created_at DESC',
@@ -134,6 +136,8 @@ router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, re
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
           places_vendues: row.places_vendues,
           revenue: parseInt(row.revenue) || 0,
+          status: row.status,
+          rejection_reason: row.rejection_reason,
           created_at: row.created_at
         };
       });
@@ -229,7 +233,7 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
       var row = result.rows[0];
       res.status(201).json({
         success: true,
-        message: 'Événement créé',
+        message: 'Événement créé. En attente de validation par notre équipe.',
         event: {
           id: row.id.toString(),
           title: row.title,
@@ -238,7 +242,8 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
           lieu: row.lieu,
           prix: row.prix_display,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-          longitude: row.longitude !== null ? parseFloat(row.longitude) : null
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          status: row.status
         }
       });
     })
