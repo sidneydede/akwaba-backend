@@ -176,6 +176,17 @@ CREATE INDEX IF NOT EXISTS idx_payouts_organizer ON payouts(organizer_id, status
 CREATE INDEX IF NOT EXISTS idx_payouts_status_scheduled ON payouts(status, scheduled_at);\n\
 CREATE INDEX IF NOT EXISTS idx_payouts_event ON payouts(event_id);\n\
 \n\
+-- v2-B : flag d'auto-release calculé par le CRON (refund ratio < seuil ET amount < threshold).\n\
+-- Permet à l'admin de voir d'un coup d'œil les payouts \"safe\" à releaser en bulk.\n\
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS auto_release_eligible BOOLEAN DEFAULT false;\n\
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS transfer_reference VARCHAR(100);\n\
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS transfer_status VARCHAR(20);\n\
+ALTER TABLE payouts ADD COLUMN IF NOT EXISTS transfer_data JSONB;\n\
+\n\
+-- v2-C : préférences utilisateur (catégories favorites pour broadcast et reco).\n\
+-- Format JSONB : { categories: [\"Festival\", \"Sport\", ...], lang?: \"fr\" }\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}';\n\
+\n\
 -- ============================================================\n\
 -- ADM-06 : Marketing (banners + featured + broadcasts)\n\
 -- ============================================================\n\

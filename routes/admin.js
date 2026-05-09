@@ -7,6 +7,7 @@ var router = express.Router();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var push = require('../services/push');
+var cinetpay = require('../services/cinetpay');
 
 // Pagination par défaut. Limite haute volontairement modeste pour
 // éviter qu'un admin ne charge accidentellement 10k lignes.
@@ -716,6 +717,7 @@ router.get('/payouts', function(req, res) {
   var listSql =
     'SELECT p.id, p.organizer_id, p.event_id, p.bookings_count, p.gross_amount, ' +
     'p.commission_amount, p.cinetpay_fees, p.net_amount, p.status, ' +
+    'p.auto_release_eligible, p.transfer_status, ' +
     'p.scheduled_at, p.released_at, p.created_at, ' +
     'u.nom AS organizer_nom, u.prenom AS organizer_prenom, u.phone AS organizer_phone, ' +
     'e.title AS event_title ' +
@@ -757,6 +759,8 @@ router.get('/payouts', function(req, res) {
             cinetpay_fees: parseInt(r.cinetpay_fees) || 0,
             net_amount: parseInt(r.net_amount) || 0,
             status: r.status,
+            auto_release_eligible: !!r.auto_release_eligible,
+            transfer_status: r.transfer_status,
             scheduled_at: r.scheduled_at,
             released_at: r.released_at,
             created_at: r.created_at,
@@ -816,6 +820,10 @@ router.get('/payouts/:id', function(req, res) {
           cinetpay_fees: parseInt(r.cinetpay_fees) || 0,
           net_amount: parseInt(r.net_amount) || 0,
           status: r.status,
+          auto_release_eligible: !!r.auto_release_eligible,
+          transfer_status: r.transfer_status,
+          transfer_reference: r.transfer_reference,
+          transfer_data: r.transfer_data,
           scheduled_at: r.scheduled_at,
           released_at: r.released_at,
           released_by: r.released_by ? {
@@ -939,14 +947,16 @@ router.post('/events/:id/schedule-payout', function(req, res) {
 });
 
 // POST /admin/payouts/:id/release — Marque le payout comme releasé.
-// Le virement réel mobile money/banque se fait via le back-office CinetPay
-// Payouts ou manuellement par l'équipe finance — cette route ne fait que tracer.
+// Si CINETPAY_TRANSFER_ENABLED=true et payout_account valide, déclenche aussi
+// le transfer mobile money via CinetPay Transfer API. Sinon mode manuel : l'admin
+// finance fait le virement via back-office CinetPay et cette route ne trace que.
 // @body {string} notes - Note optionnelle
 router.post('/payouts/:id/release', function(req, res) {
   var notes = (req.body.notes || '').trim();
 
   pool.query(
-    'SELECT p.id, p.status, p.organizer_id, p.net_amount, u.payout_account ' +
+    'SELECT p.id, p.status, p.organizer_id, p.net_amount, p.event_id, ' +
+    'u.payout_account, u.email AS organizer_email ' +
     'FROM payouts p LEFT JOIN users u ON u.id = p.organizer_id WHERE p.id = $1',
     [req.params.id]
   )
@@ -964,17 +974,55 @@ router.post('/payouts/:id/release', function(req, res) {
 
       // Snapshot du payout_account au moment du release (au cas où il change après).
       var accountSnapshot = p.payout_account;
+      var netAmount = parseInt(p.net_amount);
 
-      return pool.query(
-        "UPDATE payouts SET status = 'released', released_at = NOW(), released_by = $1, " +
-        'account_info = $2, notes = COALESCE($3, notes), updated_at = NOW() WHERE id = $4 RETURNING id',
-        [req.admin.id, accountSnapshot, notes || null, req.params.id]
-      ).then(function(upd) {
-        logAudit(req.admin.id, 'payout.release', 'payout', upd.rows[0].id, {
-          net_amount: parseInt(p.net_amount),
-          account: accountSnapshot,
+      // Si CinetPay Transfer activé + compte renseigné, déclenche le transfer.
+      var transferPromise;
+      if (cinetpay.isTransferEnabled() && accountSnapshot && accountSnapshot.provider) {
+        transferPromise = cinetpay.transferPayout({
+          amount: netAmount,
+          account: Object.assign({}, accountSnapshot, { email: p.organizer_email }),
+          reference: 'AKWABA-PAYOUT-' + p.id,
         });
-        res.json({ success: true, payout: { id: upd.rows[0].id.toString(), status: 'released' } });
+      } else {
+        transferPromise = Promise.resolve({
+          ok: false,
+          status: 'manual_required',
+          raw: { message: 'Transfer manuel — CinetPay Transfer non activé ou compte absent' },
+        });
+      }
+
+      return transferPromise.then(function(transferResult) {
+        // Le release est tracé en DB que le transfer ait réussi ou non — c'est l'admin
+        // qui décide. transfer_status laisse trace de ce qui s'est passé.
+        return pool.query(
+          "UPDATE payouts SET status = 'released', released_at = NOW(), released_by = $1, " +
+          'account_info = $2, notes = COALESCE($3, notes), ' +
+          'transfer_status = $4, transfer_reference = $5, transfer_data = $6, ' +
+          'updated_at = NOW() WHERE id = $7 RETURNING id',
+          [
+            req.admin.id, accountSnapshot, notes || null,
+            transferResult.status, transferResult.transfer_reference || null,
+            JSON.stringify(transferResult.raw || {}),
+            req.params.id,
+          ]
+        ).then(function(upd) {
+          logAudit(req.admin.id, 'payout.release', 'payout', upd.rows[0].id, {
+            net_amount: netAmount,
+            account: accountSnapshot,
+            transfer_status: transferResult.status,
+            transfer_ref: transferResult.transfer_reference,
+          });
+          res.json({
+            success: true,
+            payout: {
+              id: upd.rows[0].id.toString(),
+              status: 'released',
+              transfer_status: transferResult.status,
+              transfer_reference: transferResult.transfer_reference,
+            },
+          });
+        });
       });
     })
     .catch(function(err) {
@@ -1189,11 +1237,17 @@ router.post('/notifications/broadcast', function(req, res) {
   if (title.length > 120 || body.length > 500) {
     return res.status(400).json({ success: false, message: 'title <= 120, body <= 500 chars' });
   }
-  if (segment !== 'all' && segment !== 'role') {
-    return res.status(400).json({ success: false, message: 'segment doit être "all" ou "role"' });
+  if (segment !== 'all' && segment !== 'role' && segment !== 'category') {
+    return res.status(400).json({
+      success: false,
+      message: 'segment doit être "all", "role" ou "category"',
+    });
   }
-  if (segment === 'role' && !segmentValue) {
-    return res.status(400).json({ success: false, message: 'segment_value requis pour segment=role' });
+  if ((segment === 'role' || segment === 'category') && !segmentValue) {
+    return res.status(400).json({
+      success: false,
+      message: 'segment_value requis pour segment=' + segment,
+    });
   }
 
   push.notifySegment(segment, segmentValue, { title: title, body: body, data: data })
@@ -1266,6 +1320,52 @@ router.get('/broadcasts', function(req, res) {
       console.error('Erreur GET /admin/broadcasts:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
+});
+
+// ============================================================
+// Upload signatures (v2-D) — pour Cloudinary direct upload
+// ============================================================
+
+// POST /admin/upload-signature — Génère une signature Cloudinary pour upload direct
+// depuis le navigateur. Le fichier ne transite jamais par notre backend (économise
+// bandwidth Render + élimine la limite de body size).
+// @body {string} folder (optionnel) - dossier Cloudinary (défaut: akwaba/banners)
+// @returns {object} { signature, timestamp, api_key, cloud_name, folder }
+router.post('/upload-signature', function(req, res) {
+  var crypto = require('crypto');
+  var apiKey = process.env.CLOUDINARY_API_KEY;
+  var apiSecret = process.env.CLOUDINARY_API_SECRET;
+  var cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+
+  if (!apiKey || !apiSecret || !cloudName) {
+    return res.status(503).json({
+      success: false,
+      message: 'Cloudinary non configuré (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET requis)',
+    });
+  }
+
+  var folder = req.body.folder || 'akwaba/banners';
+  // Whitelist des dossiers pour éviter écriture arbitraire.
+  if (!/^akwaba\/(banners|events|users)(\/[a-zA-Z0-9_-]+)?$/.test(folder)) {
+    return res.status(400).json({ success: false, message: 'folder invalide' });
+  }
+
+  var timestamp = Math.floor(Date.now() / 1000);
+  // Cloudinary signe les params triés alphabétiquement, joints par &, + apiSecret en suffixe.
+  var paramsToSign = 'folder=' + folder + '&timestamp=' + timestamp;
+  var signature = crypto.createHash('sha1').update(paramsToSign + apiSecret).digest('hex');
+
+  logAudit(req.admin.id, 'upload.signature', 'cloudinary', folder, null);
+
+  res.json({
+    success: true,
+    signature: signature,
+    timestamp: timestamp,
+    api_key: apiKey,
+    cloud_name: cloudName,
+    folder: folder,
+    upload_url: 'https://api.cloudinary.com/v1_1/' + cloudName + '/image/upload',
+  });
 });
 
 // ============================================================

@@ -249,7 +249,7 @@ router.post('/verify-otp', function(req, res) {
 // GET /auth/me — Récupère le profil de l'utilisateur connecté
 router.get('/me', auth.authMiddleware, function(req, res) {
   pool.query(
-    'SELECT id, nom, prenom, phone, role, created_at FROM users WHERE id = $1',
+    'SELECT id, nom, prenom, phone, role, preferences, created_at FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -273,6 +273,7 @@ router.get('/me', auth.authMiddleware, function(req, res) {
               prenom: user.prenom,
               phone: user.phone,
               role: user.role,
+              preferences: user.preferences || {},
               created_at: user.created_at
             },
             stats: {
@@ -284,6 +285,40 @@ router.get('/me', auth.authMiddleware, function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur auth/me:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /auth/me/preferences — Met à jour les préférences de l'utilisateur connecté.
+// @body {object} preferences - { categories?: string[], lang?: string }
+// On merge avec l'existant pour ne pas écraser les autres clés.
+router.patch('/me/preferences', auth.authMiddleware, function(req, res) {
+  var input = req.body.preferences;
+  if (!input || typeof input !== 'object') {
+    return res.status(400).json({ success: false, message: 'preferences (object) requis' });
+  }
+
+  // Validation : categories doit être un array de strings si fourni.
+  if (input.categories !== undefined) {
+    if (!Array.isArray(input.categories) ||
+        !input.categories.every(function(c) { return typeof c === 'string'; })) {
+      return res.status(400).json({
+        success: false, message: 'preferences.categories doit être un array de strings',
+      });
+    }
+  }
+
+  // Merge JSONB : COALESCE pour le cas où preferences est NULL en base.
+  pool.query(
+    "UPDATE users SET preferences = COALESCE(preferences, '{}') || $1::jsonb, updated_at = NOW() " +
+    'WHERE id = $2 RETURNING preferences',
+    [JSON.stringify(input), req.userId]
+  )
+    .then(function(r) {
+      res.json({ success: true, preferences: r.rows[0].preferences });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /auth/me/preferences:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });

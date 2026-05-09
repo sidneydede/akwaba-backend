@@ -95,4 +95,13 @@ app.listen(PORT, function() {
     var reconcile = require('./jobs/reconcile-payments');
     reconcile.start();
   }
+
+  // Worker d'auto-scheduling payouts (v2-A). Crée automatiquement un payout
+  // 'scheduled' pour chaque event terminé + escrow_hours qui n'en a pas.
+  // Pas de dépendance aux creds CinetPay — peut tourner en dev. Désactivable
+  // via DISABLE_PAYOUT_SCHEDULING=true.
+  if (process.env.DISABLE_PAYOUT_SCHEDULING !== 'true') {
+    var schedulePayouts = require('./jobs/schedule-payouts');
+    schedulePayouts.start();
+  }
 });

@@ -78,8 +78,10 @@ function notifyUser(userId, payload) {
 
 // Envoie une notification push à un segment d'utilisateurs (broadcast).
 // Segments supportés :
-//   - 'all'     : tous les users avec un token actif
-//   - 'role'    : segmentValue = 'participant' | 'organisateur'
+//   - 'all'      : tous les users avec un token actif
+//   - 'role'     : segmentValue = 'participant' | 'organisateur'
+//   - 'category' : segmentValue = catégorie (ex: 'Festival') ; cible les users
+//                  dont preferences.categories contient cette valeur
 // Retourne { recipients_count, sent_count, failed_count }.
 // Batch par chunks de 100 (limite Expo).
 // @param {string} segment
@@ -94,6 +96,12 @@ function notifySegment(segment, segmentValue, payload) {
     if (!segmentValue) return Promise.resolve({ recipients_count: 0, sent_count: 0, failed_count: 0 });
     params.push(segmentValue);
     clauses.push('u.role = $' + params.length);
+  } else if (segment === 'category') {
+    if (!segmentValue) return Promise.resolve({ recipients_count: 0, sent_count: 0, failed_count: 0 });
+    // JSONB contains : preferences->'categories' contient la string segmentValue.
+    // On compare avec un array d'une string : ['"Festival"']
+    params.push(JSON.stringify([segmentValue]));
+    clauses.push('u.preferences->\'categories\' @> $' + params.length + '::jsonb');
   }
   // Exclut les comptes suspendus.
   clauses.push('u.suspended_at IS NULL');

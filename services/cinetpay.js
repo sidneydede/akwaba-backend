@@ -14,6 +14,17 @@ var CINETPAY_CHECK_URL = 'https://api-checkout.cinetpay.com/v2/payment/check';
 var BACKEND_URL = process.env.BACKEND_URL || 'https://akwaba-backend.onrender.com';
 var FRONT_RETURN_URL = process.env.FRONT_RETURN_URL || 'https://akwaba.ci/billet-confirme';
 
+// Transfer API (produit séparé CinetPay, auth distincte).
+// Activable via CINETPAY_TRANSFER_ENABLED=true ; sinon transferPayout retourne 'manual_required'.
+var CINETPAY_TRANSFER_ENABLED = process.env.CINETPAY_TRANSFER_ENABLED === 'true';
+var CINETPAY_TRANSFER_LOGIN = process.env.CINETPAY_TRANSFER_LOGIN;
+var CINETPAY_TRANSFER_PASSWORD = process.env.CINETPAY_TRANSFER_PASSWORD;
+var CINETPAY_TRANSFER_AUTH_URL = 'https://client.cinetpay.com/v1/auth/login';
+var CINETPAY_TRANSFER_SEND_URL = 'https://client.cinetpay.com/v1/transfer/money/send/contact';
+
+// Token Transfer API en cache mémoire (TTL 23h pour rester sûr — CinetPay donne 24h).
+var transferTokenCache = { token: null, expiresAt: 0 };
+
 // Vérifie le HMAC-SHA256 du header x-token envoyé par CinetPay.
 // L'algo CinetPay : SHA256(secretKey, concat(champs ordonnés)).
 // Retourne true si le token correspond, false sinon. Si SECRET_KEY n'est pas configurée,
@@ -136,8 +147,128 @@ function initPayment(params) {
     });
 }
 
+// ============================================================
+// Transfer API (B2C payout vers mobile money / banque)
+// ============================================================
+
+// Récupère un token Transfer API frais (cache 23h).
+// CinetPay Transfer auth = apikey + login + password (distinct du Checkout).
+// @returns {Promise<string>} token
+function getTransferToken() {
+  if (transferTokenCache.token && transferTokenCache.expiresAt > Date.now()) {
+    return Promise.resolve(transferTokenCache.token);
+  }
+  if (!CINETPAY_API_KEY || !CINETPAY_TRANSFER_LOGIN || !CINETPAY_TRANSFER_PASSWORD) {
+    return Promise.reject(new Error(
+      'CinetPay Transfer non configuré (CINETPAY_API_KEY, CINETPAY_TRANSFER_LOGIN, CINETPAY_TRANSFER_PASSWORD requis)'
+    ));
+  }
+
+  var form = new URLSearchParams();
+  form.append('apikey', CINETPAY_API_KEY);
+  form.append('login', CINETPAY_TRANSFER_LOGIN);
+  form.append('password', CINETPAY_TRANSFER_PASSWORD);
+
+  return fetch(CINETPAY_TRANSFER_AUTH_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+  })
+    .then(function(res) { return res.json(); })
+    .then(function(json) {
+      if (json.code !== 0 || !json.data || !json.data.token) {
+        throw new Error('Login Transfer CinetPay échoué: ' + (json.message || 'unknown'));
+      }
+      transferTokenCache.token = json.data.token;
+      transferTokenCache.expiresAt = Date.now() + 23 * 3600 * 1000;
+      return json.data.token;
+    });
+}
+
+// Mappe nos providers internes vers les codes CinetPay Transfer.
+// CinetPay attend prefix + phone (ex: prefix="225", phone="0102030405").
+function parseProvider(provider) {
+  // Tous les mobile money CI passent par prefix '225'. Pour banque on a un autre flow.
+  if (provider === 'orange_money') return 'OMCIV2';
+  if (provider === 'mtn_momo') return 'FLOOZ';
+  if (provider === 'wave') return 'WAVE';
+  if (provider === 'moov') return 'FLOOZ';
+  return null;
+}
+
+// Initie un transfer mobile money via CinetPay Transfer.
+// @param {object} params
+//   - amount: number (FCFA, entier)
+//   - account: { provider, number, name }
+//   - reference: string (notre payout id, sert d'identifiant unique côté CinetPay)
+// @returns {Promise<{ok: boolean, status: string, transfer_reference?: string, raw: object}>}
+function transferPayout(params) {
+  if (!CINETPAY_TRANSFER_ENABLED) {
+    // Mode manuel : on ne fait rien, l'admin valide via back-office CinetPay.
+    return Promise.resolve({
+      ok: false,
+      status: 'manual_required',
+      raw: { message: 'CinetPay Transfer non activé (CINETPAY_TRANSFER_ENABLED=false). Reversement manuel requis.' },
+    });
+  }
+
+  var providerCode = parseProvider(params.account.provider);
+  if (!providerCode) {
+    return Promise.resolve({
+      ok: false,
+      status: 'unsupported_provider',
+      raw: { message: 'Provider ' + params.account.provider + ' non supporté par CinetPay Transfer' },
+    });
+  }
+
+  // Numéro au format E.164 attendu par CinetPay : prefix=225, phone sans le 0 de tête.
+  var phone = String(params.account.number).replace(/^\+225/, '').replace(/^225/, '').replace(/^0/, '');
+
+  // Split nom complet en first/last (CinetPay attend les deux).
+  var nameParts = (params.account.name || '').trim().split(/\s+/);
+  var firstName = nameParts[0] || 'Client';
+  var lastName = nameParts.slice(1).join(' ') || 'Akwaba';
+
+  return getTransferToken().then(function(token) {
+    var body = [{
+      prefix: '225',
+      phone: phone,
+      amount: String(params.amount),
+      client_transaction_id: params.reference,
+      payment_method: providerCode,
+      notify_url: BACKEND_URL + '/payments/transfer-notify',
+      lastname: lastName,
+      firstname: firstName,
+      email: params.account.email || 'client@akwaba.ci',
+    }];
+
+    return fetch(CINETPAY_TRANSFER_SEND_URL + '?token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: JSON.stringify(body) }),
+    })
+      .then(function(res) { return res.json(); })
+      .then(function(json) {
+        var data = json.data && json.data[0];
+        var ok = json.code === 0 && data && (data.status === 'PENDING' || data.status === 'CONFIRM');
+        return {
+          ok: ok,
+          status: data ? data.status : 'ERROR',
+          transfer_reference: data ? data.transaction_id : null,
+          raw: json,
+        };
+      });
+  })
+    .catch(function(err) {
+      console.error('Erreur transferPayout:', err.message);
+      return { ok: false, status: 'ERROR', raw: { error: err.message } };
+    });
+}
+
 module.exports = {
   verifyHmacToken: verifyHmacToken,
   verifyTransactionWithApi: verifyTransactionWithApi,
   initPayment: initPayment,
+  transferPayout: transferPayout,
+  isTransferEnabled: function() { return CINETPAY_TRANSFER_ENABLED; },
 };
