@@ -149,6 +149,122 @@ router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, re
     });
 });
 
+// GET /events/:id/dashboard — Tableau de bord d'un événement pour son orga.
+// Retourne : event + stats + liste détaillée des bookings (user, statut, scan).
+// Permission : orga propriétaire uniquement.
+router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var eventId = req.params.id;
+
+  Promise.all([
+    pool.query(
+      'SELECT id, organizer_id, title, description, category, date, start_at, end_at, ' +
+      'lieu, prix, prix_display, emoji, color, chaud, image_url, ' +
+      'places_total, places_restantes, status, rejection_reason, created_at ' +
+      'FROM events WHERE id = $1',
+      [eventId]
+    ),
+    pool.query(
+      'SELECT b.id, b.ref, b.quantity, b.total_amount, b.statut, b.created_at, ' +
+      'b.utilise_at, b.cancelled_at, b.refund_amount, ' +
+      'u.id AS user_id, u.nom, u.prenom, u.phone ' +
+      'FROM bookings b LEFT JOIN users u ON u.id = b.user_id ' +
+      'WHERE b.event_id = $1 ORDER BY b.created_at DESC',
+      [eventId]
+    ),
+  ])
+    .then(function(results) {
+      if (results[0].rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Événement non trouvé' });
+      }
+      var ev = results[0].rows[0];
+      if (ev.organizer_id !== req.userId) {
+        return res.status(403).json({
+          success: false,
+          message: 'Cet événement ne vous appartient pas',
+        });
+      }
+
+      var bookings = results[1].rows;
+      var stats = {
+        bookings_total: bookings.length,
+        bookings_confirme: 0,
+        bookings_attente: 0,
+        bookings_annule: 0,
+        bookings_utilise: 0,
+        billets_vendus: 0,        // sum quantity confirmed (=places vendues)
+        revenue_brut: 0,          // sum total_amount confirmed
+        billets_scannes: 0,       // sum quantity used
+        refund_total: 0,          // sum refund_amount on cancelled
+      };
+      bookings.forEach(function(b) {
+        if (b.statut === 'confirme') {
+          stats.bookings_confirme++;
+          stats.billets_vendus += b.quantity;
+          stats.revenue_brut += parseInt(b.total_amount) || 0;
+        } else if (b.statut === 'en_attente') {
+          stats.bookings_attente++;
+        } else if (b.statut === 'utilise') {
+          stats.bookings_utilise++;
+          stats.billets_scannes += b.quantity;
+          stats.billets_vendus += b.quantity;          // utilise inclut "vendu et scanné"
+          stats.revenue_brut += parseInt(b.total_amount) || 0;
+        } else if (b.statut === 'annule') {
+          stats.bookings_annule++;
+          stats.refund_total += parseInt(b.refund_amount) || 0;
+        }
+      });
+
+      res.json({
+        success: true,
+        event: {
+          id: ev.id.toString(),
+          title: ev.title,
+          description: ev.description,
+          category: ev.category,
+          date: ev.date,
+          start_at: ev.start_at,
+          end_at: ev.end_at,
+          lieu: ev.lieu,
+          prix: ev.prix_display,
+          prix_num: ev.prix,
+          emoji: ev.emoji,
+          color: ev.color,
+          chaud: ev.chaud,
+          image_url: ev.image_url,
+          places_total: ev.places_total,
+          places_restantes: ev.places_restantes,
+          status: ev.status,
+          rejection_reason: ev.rejection_reason,
+          created_at: ev.created_at,
+        },
+        stats: stats,
+        bookings: bookings.map(function(b) {
+          return {
+            id: b.id.toString(),
+            ref: b.ref,
+            quantity: b.quantity,
+            total_amount: parseInt(b.total_amount) || 0,
+            statut: b.statut,
+            created_at: b.created_at,
+            utilise_at: b.utilise_at,
+            cancelled_at: b.cancelled_at,
+            refund_amount: b.refund_amount != null ? parseInt(b.refund_amount) : null,
+            user: b.user_id ? {
+              id: b.user_id.toString(),
+              nom: b.nom,
+              prenom: b.prenom,
+              phone: b.phone,
+            } : null,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /events/:id/dashboard:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // GET /events/:id — Détail d'un événement
 router.get('/:id', function(req, res) {
   pool.query('SELECT * FROM events WHERE id = $1', [req.params.id])
