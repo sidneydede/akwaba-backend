@@ -289,6 +289,81 @@ router.get('/me', auth.authMiddleware, function(req, res) {
     });
 });
 
+// PATCH /auth/me — Met à jour le profil de l'utilisateur connecté.
+// Champs autorisés : prenom, nom. Le téléphone n'est PAS modifiable ici
+// (nominatif → nécessite re-OTP, à traiter dans un endpoint dédié). Le role
+// et l'id ne sont jamais modifiables par l'utilisateur lui-même.
+// @body {string} [prenom] - 1 à 50 caractères
+// @body {string} [nom]    - 1 à 50 caractères
+router.patch('/me', auth.authMiddleware, function(req, res) {
+  var input = req.body || {};
+  var sets = [];
+  var values = [];
+  var i = 1;
+
+  if (input.prenom !== undefined) {
+    var p = String(input.prenom).trim();
+    if (!p || p.length > 50) {
+      return res.status(400).json({
+        success: false,
+        message: 'Prénom invalide (1 à 50 caractères).'
+      });
+    }
+    sets.push('prenom = $' + i++);
+    values.push(p);
+  }
+
+  if (input.nom !== undefined) {
+    var n = String(input.nom).trim();
+    if (!n || n.length > 50) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nom invalide (1 à 50 caractères).'
+      });
+    }
+    sets.push('nom = $' + i++);
+    values.push(n);
+  }
+
+  if (sets.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: 'Aucun champ à mettre à jour (prenom et/ou nom requis).'
+    });
+  }
+
+  sets.push('updated_at = NOW()');
+  values.push(req.userId);
+
+  pool.query(
+    'UPDATE users SET ' + sets.join(', ') + ' WHERE id = $' + i +
+    ' RETURNING id, nom, prenom, phone, role, preferences, created_at',
+    values
+  )
+    .then(function(result) {
+      if (result.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Utilisateur introuvable' });
+      }
+      var user = result.rows[0];
+      res.json({
+        success: true,
+        user: {
+          id: user.id.toString(),
+          nom: user.nom,
+          prenom: user.prenom,
+          phone: user.phone,
+          role: user.role,
+          preferences: user.preferences || {},
+          created_at: user.created_at
+        }
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /auth/me:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // PATCH /auth/me/preferences — Met à jour les préférences de l'utilisateur connecté.
 // @body {object} preferences - { categories?: string[], lang?: string }
 // On merge avec l'existant pour ne pas écraser les autres clés.
