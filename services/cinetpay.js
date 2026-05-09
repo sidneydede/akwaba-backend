@@ -92,8 +92,10 @@ function verifyTransactionWithApi(transactionId) {
 }
 
 // Normalise un numéro vers le format international E.164 attendu par CinetPay.
-// Ex : "0787906706" → "+2250787906706", "2250787906706" → "+2250787906706".
-// CinetPay code 624 vient souvent d'un numéro non-international qu'ils n'arrivent
+// IMPORTANT : en Côte d'Ivoire, le 0 initial fait partie du numéro local
+// (format 10 chiffres depuis 2021), donc on NE STRIPPE PAS le 0 quand on
+// préfixe +225. Numéro local "0787906706" → international "+2250787906706".
+// CinetPay code 624 vient souvent d'un numéro mal formé qu'ils n'arrivent
 // pas à valider auprès des opérateurs mobile money.
 function normalizePhone(phone) {
   if (!phone) return '';
@@ -101,7 +103,9 @@ function normalizePhone(phone) {
   if (s.startsWith('+225')) return s;
   if (s.startsWith('225')) return '+' + s;
   if (s.startsWith('+')) return s;
-  if (s.startsWith('0')) return '+225' + s.substring(1);
+  // Format local CI 10 chiffres (commence par 0) : on préfixe +225 sans stripper le 0.
+  if (s.startsWith('0')) return '+225' + s;
+  // 9 chiffres sans 0 (ancien format ou saisie partielle) : on préfixe +2250.
   return '+225' + s;
 }
 
