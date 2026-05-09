@@ -7,6 +7,8 @@ var crypto = require('crypto');
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var push = require('../services/push');
+var qr = require('../services/qr');
+var cinetpay = require('../services/cinetpay');
 
 // Envoie les notifications "billet confirmé" au participant et à l'organisateur.
 // Appelé après qu'un booking passe en statut 'confirme'. N'attend pas le résultat
@@ -86,34 +88,107 @@ router.post('/', auth.authMiddleware, function(req, res) {
       var ref = generateRef();
       var totalAmount = event.prix * quantity;
 
-      // Crée la réservation
+      // Crée la réservation en 'en_attente' (transaction_id = ref pour le tracking CinetPay)
       return pool.query(
-        "INSERT INTO bookings (user_id, event_id, ref, quantity, total_amount, paiement_method, statut) VALUES ($1, $2, $3, $4, $5, $6, 'en_attente') RETURNING *",
+        "INSERT INTO bookings (user_id, event_id, ref, quantity, total_amount, paiement_method, statut, transaction_id) " +
+        "VALUES ($1, $2, $3, $4, $5, $6, 'en_attente', $3) RETURNING *",
         [req.userId, eventId, ref, quantity, totalAmount, paiement]
       )
         .then(function(bookingResult) {
           var booking = bookingResult.rows[0];
 
-          // Décrémente les places restantes
+          // Décrémente les places restantes (soft-lock — sera relâché si paiement échoue
+          // via le job de réconciliation cinetpay)
           return pool.query(
             'UPDATE events SET places_restantes = places_restantes - $1 WHERE id = $2',
             [quantity, eventId]
           )
             .then(function() {
-              res.status(201).json({
-                success: true,
-                message: 'Réservation confirmée',
-                booking: {
-                  id: booking.id.toString(),
-                  eventId: booking.event_id.toString(),
-                  ref: booking.ref,
-                  quantity: booking.quantity,
-                  total_amount: totalAmount,
-                  paiement: booking.paiement_method,
-                  statut: booking.statut,
-                  createdAt: booking.created_at
-                }
-              });
+              // Récupère les infos user pour CinetPay
+              return pool.query('SELECT id, nom, prenom, phone FROM users WHERE id = $1', [req.userId]);
+            })
+            .then(function(userResult) {
+              var user = userResult.rows[0] || {};
+
+              // Si l'event est gratuit (prix = 0), on confirme directement sans CinetPay.
+              if (totalAmount === 0) {
+                return pool.query(
+                  "UPDATE bookings SET statut = 'confirme', updated_at = NOW() WHERE id = $1 RETURNING id",
+                  [booking.id]
+                ).then(function() {
+                  notifyBookingConfirmed(booking.id);
+                  return res.status(201).json({
+                    success: true,
+                    message: 'Réservation gratuite confirmée',
+                    booking: {
+                      id: booking.id.toString(),
+                      eventId: booking.event_id.toString(),
+                      ref: booking.ref,
+                      qr_payload: qr.signRef(booking.ref),
+                      quantity: booking.quantity,
+                      total_amount: 0,
+                      paiement: 'gratuit',
+                      statut: 'confirme',
+                      payment_url: null,
+                      createdAt: booking.created_at
+                    }
+                  });
+                });
+              }
+
+              // Initie le paiement CinetPay et récupère l'URL à ouvrir côté mobile.
+              return cinetpay.initPayment({
+                ref: ref,
+                amount: totalAmount,
+                description: '« ' + event.title + ' » · ' + quantity + ' billet' + (quantity > 1 ? 's' : ''),
+                customer: {
+                  id: user.id,
+                  name: user.nom,
+                  surname: user.prenom,
+                  phone: user.phone,
+                },
+                channels: paiement === 'card' ? 'CREDIT_CARD' : 'ALL',
+              })
+                .then(function(initResult) {
+                  if (!initResult.ok) {
+                    // Init CinetPay a échoué : on annule le booking et on relâche les places.
+                    console.error('CinetPay init échoué pour', ref, ':', initResult.raw);
+                    return pool.query(
+                      "UPDATE bookings SET statut = 'annule', updated_at = NOW() WHERE id = $1",
+                      [booking.id]
+                    )
+                      .then(function() {
+                        return pool.query(
+                          'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',
+                          [quantity, eventId]
+                        );
+                      })
+                      .then(function() {
+                        res.status(502).json({
+                          success: false,
+                          message: 'Initialisation du paiement impossible. Réessayez plus tard.',
+                        });
+                      });
+                  }
+
+                  res.status(201).json({
+                    success: true,
+                    message: 'Réservation créée, redirection vers le paiement',
+                    booking: {
+                      id: booking.id.toString(),
+                      eventId: booking.event_id.toString(),
+                      ref: booking.ref,
+                      qr_payload: qr.signRef(booking.ref),
+                      quantity: booking.quantity,
+                      total_amount: totalAmount,
+                      paiement: booking.paiement_method,
+                      statut: booking.statut,
+                      payment_url: initResult.payment_url,
+                      payment_token: initResult.payment_token,
+                      createdAt: booking.created_at
+                    }
+                  });
+                });
             });
         });
     })
@@ -137,6 +212,9 @@ router.get('/', auth.authMiddleware, function(req, res) {
         return {
           id: row.id.toString(),
           ref: row.ref,
+          // qr_payload : ce que doit afficher le QR code (ref + signature HMAC).
+          // Calculé à la volée — HMAC déterministe, pas de stockage en base nécessaire.
+          qr_payload: qr.signRef(row.ref),
           quantity: row.quantity,
           total_amount: row.total_amount,
           paiement: row.paiement_method,
@@ -158,6 +236,140 @@ router.get('/', auth.authMiddleware, function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur GET /bookings:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /bookings/check-in — Scan QR à l'entrée par l'organisateur
+// Webapp orga décode le QR (AKWABA-BILLET:AKW-XXXXXXXX.HHHHHHHHHHHHHHHH) et envoie
+// le payload ici. Le serveur vérifie la signature HMAC, l'ownership orga, le statut,
+// puis marque le billet 'utilise'.
+// @body {string} payload - Contenu QR signé: 'AKW-XXXXXXXX.HHHHHHHHHHHHHHHH'
+//   (compat ancien format : accepte aussi {ref} pour les billets pré-signature ; bientôt obsolète)
+router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var ref;
+
+  // Nouveau format signé (obligatoire à terme).
+  if (req.body.payload) {
+    var verified = qr.parseAndVerify(req.body.payload);
+    if (!verified.ok) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_SIGNATURE',
+        message: 'Signature du billet invalide. Le QR a été falsifié ou est corrompu.'
+      });
+    }
+    ref = verified.ref;
+  } else if (req.body.ref) {
+    // Compat temporaire pour billets pré-signature (à retirer après 30j de prod).
+    ref = req.body.ref;
+    if (typeof ref !== 'string' || !/^AKW-[A-F0-9]{8}$/.test(ref)) {
+      return res.status(400).json({
+        success: false,
+        code: 'INVALID_REF',
+        message: 'Référence de billet invalide. Format attendu : AKW-XXXXXXXX.'
+      });
+    }
+  } else {
+    return res.status(400).json({
+      success: false,
+      code: 'MISSING_PAYLOAD',
+      message: 'Champ payload (QR signé) requis.'
+    });
+  }
+
+  // 1) Lookup billet + event + participant en une seule requête
+  pool.query(
+    'SELECT b.id, b.statut, b.quantity, b.utilise_at, ' +
+    'e.id AS event_id, e.organizer_id, e.title AS event_title, ' +
+    'u.nom, u.prenom ' +
+    'FROM bookings b ' +
+    'JOIN events e ON b.event_id = e.id ' +
+    'JOIN users u ON b.user_id = u.id ' +
+    'WHERE b.ref = $1',
+    [ref]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          code: 'NOT_FOUND',
+          message: 'Aucun billet ne correspond à cette référence.'
+        });
+      }
+
+      var b = result.rows[0];
+
+      // 2) Ownership : seul l'orga propriétaire de l'event peut check-in
+      if (b.organizer_id !== req.user.id) {
+        return res.status(403).json({
+          success: false,
+          code: 'NOT_YOUR_EVENT',
+          message: 'Ce billet appartient à un événement d\'un autre organisateur.'
+        });
+      }
+
+      // 3) Statuts non-checkin-able
+      if (b.statut === 'utilise') {
+        return res.status(409).json({
+          success: false,
+          code: 'ALREADY_USED',
+          message: 'Billet déjà scanné.',
+          utilise_at: b.utilise_at,
+          participant: { nom: b.nom, prenom: b.prenom }
+        });
+      }
+      if (b.statut === 'annule') {
+        return res.status(410).json({
+          success: false,
+          code: 'CANCELLED',
+          message: 'Billet annulé.'
+        });
+      }
+      if (b.statut === 'en_attente') {
+        return res.status(402).json({
+          success: false,
+          code: 'PAYMENT_PENDING',
+          message: 'Paiement non confirmé pour ce billet.'
+        });
+      }
+      if (b.statut !== 'confirme') {
+        return res.status(409).json({
+          success: false,
+          code: 'INVALID_STATUS',
+          message: 'Statut billet inattendu : ' + b.statut
+        });
+      }
+
+      // 4) UPDATE conditionnel : protège contre la race condition double-scan.
+      //    Si un autre scan passe entre le SELECT et l'UPDATE, rowCount=0 → on renvoie 409.
+      return pool.query(
+        "UPDATE bookings SET statut = 'utilise', utilise_at = NOW(), checkin_by = $2 " +
+        "WHERE id = $1 AND statut = 'confirme' RETURNING utilise_at",
+        [b.id, req.user.id]
+      )
+        .then(function(updResult) {
+          if (updResult.rowCount === 0) {
+            return res.status(409).json({
+              success: false,
+              code: 'ALREADY_USED',
+              message: 'Billet scanné juste à l\'instant par un autre scan.'
+            });
+          }
+          res.json({
+            success: true,
+            checkin: {
+              ref: ref,
+              participant: { nom: b.nom, prenom: b.prenom },
+              places: b.quantity,
+              event_title: b.event_title,
+              utilise_at: updResult.rows[0].utilise_at
+            }
+          });
+        });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /bookings/check-in:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });

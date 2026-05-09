@@ -102,6 +102,15 @@ ALTER TABLE events ADD COLUMN IF NOT EXISTS moderated_by INTEGER REFERENCES user
 ALTER TABLE events ADD COLUMN IF NOT EXISTS moderated_at TIMESTAMP;\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS rejection_reason TEXT;\n\
 \n\
+-- Check-in : trace du scan QR à l'entrée par l'organisateur\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS utilise_at TIMESTAMP;\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS checkin_by INTEGER REFERENCES users(id);\n\
+\n\
+-- AUTH-05 : protection brute-force OTP (attempt limit + lockout temporaire)\n\
+-- Plus strict pour les organisateurs car compromission = accès aux fonds.\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_attempts INT DEFAULT 0;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_locked_until TIMESTAMP;\n\
+\n\
 -- Backfill : tous les events pré-existants passent à 'approved' pour ne pas\n\
 -- disparaître de l'app. Les nouveaux events partent à 'pending' (DEFAULT).\n\
 UPDATE events SET status = 'approved' WHERE status IS NULL;\n\

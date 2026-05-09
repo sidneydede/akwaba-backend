@@ -7,26 +7,39 @@ var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var sms = require('../services/sms');
 
-// Génère un code OTP à 6 chiffres
+// Génère un code OTP à 6 chiffres (crypto-random, pas Math.random qui est prédictible).
 // @returns {string}
 function generateOtp() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  var crypto = require('crypto');
+  var n = crypto.randomInt(100000, 1000000);
+  return n.toString();
 }
 
-// Calcule la date d'expiration OTP (10 minutes dans le futur)
+// Calcule la date d'expiration OTP. Plus strict pour orga (compromission = accès aux fonds).
+// @param {string} role - 'participant' | 'organisateur' | 'admin'
 // @returns {Date}
-function otpExpiry() {
-  return new Date(Date.now() + 10 * 60 * 1000);
+function otpExpiry(role) {
+  var minutes = role === 'organisateur' ? 5 : 10;
+  return new Date(Date.now() + minutes * 60 * 1000);
 }
 
-// Helper : génère + stocke + envoie un OTP pour un user existant
-// @param {object} user - Ligne user PostgreSQL
+// AUTH-05 : limites de tentatives OTP (brute-force protection).
+// Orga = 3 tentatives, lockout 30 min. Participant = 5 tentatives, lockout 15 min.
+function otpLimits(role) {
+  if (role === 'organisateur') return { maxAttempts: 3, lockoutMinutes: 30 };
+  return { maxAttempts: 5, lockoutMinutes: 15 };
+}
+
+// Helper : génère + stocke + envoie un OTP pour un user existant.
+// Reset les compteurs d'attempts (nouveau code = nouvelle fenêtre de tentatives).
+// @param {object} user - Ligne user PostgreSQL (au minimum: id, phone, role)
 // @returns {Promise<object>} { dev_otp?: string }
 function issueOtp(user) {
   var code = generateOtp();
-  var expires = otpExpiry();
+  var expires = otpExpiry(user.role);
   return pool.query(
-    'UPDATE users SET otp_code = $1, otp_expires_at = $2, updated_at = NOW() WHERE id = $3',
+    'UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_attempts = 0, ' +
+    'otp_locked_until = NULL, updated_at = NOW() WHERE id = $3',
     [code, expires, user.id]
   )
     .then(function() {
@@ -66,7 +79,7 @@ router.post('/register', function(req, res) {
       }
 
       return pool.query(
-        'INSERT INTO users (nom, prenom, phone, role) VALUES ($1, $2, $3, $4) RETURNING id, phone',
+        'INSERT INTO users (nom, prenom, phone, role) VALUES ($1, $2, $3, $4) RETURNING id, phone, role',
         [nom, prenom, phone, role]
       )
         .then(function(insertResult) {
@@ -96,7 +109,7 @@ router.post('/login', function(req, res) {
     return res.status(400).json({ success: false, message: 'Numéro de téléphone obligatoire' });
   }
 
-  pool.query('SELECT id, phone FROM users WHERE phone = $1', [phone])
+  pool.query('SELECT id, phone, role FROM users WHERE phone = $1', [phone])
     .then(function(result) {
       if (result.rows.length === 0) {
         return res.status(404).json({
@@ -141,7 +154,8 @@ router.post('/verify-otp', function(req, res) {
   }
 
   pool.query(
-    'SELECT id, nom, prenom, phone, role, otp_code, otp_expires_at FROM users WHERE phone = $1',
+    'SELECT id, nom, prenom, phone, role, otp_code, otp_expires_at, otp_attempts, otp_locked_until ' +
+    'FROM users WHERE phone = $1',
     [phone]
   )
     .then(function(result) {
@@ -150,6 +164,17 @@ router.post('/verify-otp', function(req, res) {
       }
 
       var user = result.rows[0];
+      var limits = otpLimits(user.role);
+
+      // AUTH-05 : refus si compte verrouillé après trop de tentatives
+      if (user.otp_locked_until && new Date(user.otp_locked_until).getTime() > Date.now()) {
+        var minutesLeft = Math.ceil((new Date(user.otp_locked_until).getTime() - Date.now()) / 60000);
+        return res.status(429).json({
+          success: false,
+          code: 'LOCKED',
+          message: 'Trop de tentatives. Réessayez dans ' + minutesLeft + ' minute' + (minutesLeft > 1 ? 's' : '') + '.'
+        });
+      }
 
       if (!user.otp_code) {
         return res.status(400).json({
@@ -166,15 +191,37 @@ router.post('/verify-otp', function(req, res) {
       }
 
       if (user.otp_code !== code) {
-        return res.status(400).json({
-          success: false,
-          message: 'Code incorrect'
-        });
+        // Incrémente attempts + verrouille si dépassement.
+        var newAttempts = (user.otp_attempts || 0) + 1;
+        if (newAttempts >= limits.maxAttempts) {
+          var lockUntil = new Date(Date.now() + limits.lockoutMinutes * 60 * 1000);
+          return pool.query(
+            'UPDATE users SET otp_attempts = $1, otp_locked_until = $2, ' +
+            'otp_code = NULL, otp_expires_at = NULL WHERE id = $3',
+            [newAttempts, lockUntil, user.id]
+          ).then(function() {
+            res.status(429).json({
+              success: false,
+              code: 'LOCKED',
+              message: 'Trop de tentatives. Compte temporairement verrouillé pendant ' +
+                limits.lockoutMinutes + ' minutes.'
+            });
+          });
+        }
+        return pool.query('UPDATE users SET otp_attempts = $1 WHERE id = $2', [newAttempts, user.id])
+          .then(function() {
+            res.status(400).json({
+              success: false,
+              message: 'Code incorrect',
+              attempts_left: limits.maxAttempts - newAttempts
+            });
+          });
       }
 
-      // OK : on efface l'OTP et on retourne le token
+      // OK : on efface l'OTP, on reset les compteurs, et on retourne le token
       return pool.query(
-        'UPDATE users SET otp_code = NULL, otp_expires_at = NULL, updated_at = NOW() WHERE id = $1',
+        'UPDATE users SET otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, ' +
+        'otp_locked_until = NULL, last_login_at = NOW(), updated_at = NOW() WHERE id = $1',
         [user.id]
       )
         .then(function() {
