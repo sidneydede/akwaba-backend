@@ -130,6 +130,116 @@ CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);\n\
 CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);\n\
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);\n\
 CREATE INDEX IF NOT EXISTS idx_admin_audit_admin ON admin_audit_log(admin_id, created_at DESC);\n\
+\n\
+-- ============================================================\n\
+-- ADM-05 : Reversements organisateurs (escrow J+2)\n\
+-- ============================================================\n\
+\n\
+-- Date/heure de début parsable (TIMESTAMP). La colonne `date` reste pour rétrocompat\n\
+-- d'affichage (texte 'Sam 14 Juin · 20h00'). start_at est ce sur quoi on calcule\n\
+-- l'éligibilité au reversement (event_end + 48h).\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS start_at TIMESTAMP;\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS end_at TIMESTAMP;\n\
+\n\
+-- Compte de reversement de l'organisateur (mobile money ou bancaire).\n\
+-- Format JSONB : { provider: 'orange_money' | 'mtn_momo' | 'wave' | 'bank',\n\
+--                  number: '+225...', name: 'John Doe',\n\
+--                  bank_name?: 'NSIA', iban?: 'CI...' }\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS payout_account JSONB;\n\
+\n\
+-- Table des reversements. Un reversement = un montant net à verser à un organisateur,\n\
+-- agrégé sur une période (typiquement les bookings d'un événement, ou multi-events\n\
+-- en mode 'period'). On garde event_id NULL pour les payouts manuels multi-events.\n\
+CREATE TABLE IF NOT EXISTS payouts (\n\
+  id SERIAL PRIMARY KEY,\n\
+  organizer_id INTEGER NOT NULL REFERENCES users(id),\n\
+  event_id INTEGER REFERENCES events(id),\n\
+  period_start TIMESTAMP,\n\
+  period_end TIMESTAMP,\n\
+  bookings_count INTEGER NOT NULL DEFAULT 0,\n\
+  gross_amount BIGINT NOT NULL DEFAULT 0,\n\
+  commission_amount BIGINT NOT NULL DEFAULT 0,\n\
+  cinetpay_fees BIGINT NOT NULL DEFAULT 0,\n\
+  net_amount BIGINT NOT NULL DEFAULT 0,\n\
+  status VARCHAR(20) NOT NULL DEFAULT 'scheduled',\n\
+  scheduled_at TIMESTAMP,\n\
+  released_at TIMESTAMP,\n\
+  released_by INTEGER REFERENCES users(id),\n\
+  block_reason TEXT,\n\
+  account_info JSONB,\n\
+  notes TEXT,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  updated_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+\n\
+CREATE INDEX IF NOT EXISTS idx_payouts_organizer ON payouts(organizer_id, status);\n\
+CREATE INDEX IF NOT EXISTS idx_payouts_status_scheduled ON payouts(status, scheduled_at);\n\
+CREATE INDEX IF NOT EXISTS idx_payouts_event ON payouts(event_id);\n\
+\n\
+-- ============================================================\n\
+-- ADM-06 : Marketing (banners + featured + broadcasts)\n\
+-- ============================================================\n\
+\n\
+-- Mise en avant payante d'un event (badge À la une + position prioritaire).\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS is_featured BOOLEAN DEFAULT false;\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS featured_until TIMESTAMP;\n\
+\n\
+-- Bannières home (carousel À la une côté mobile).\n\
+CREATE TABLE IF NOT EXISTS banners (\n\
+  id SERIAL PRIMARY KEY,\n\
+  title VARCHAR(120) NOT NULL,\n\
+  subtitle VARCHAR(200),\n\
+  image_url TEXT NOT NULL,\n\
+  link_type VARCHAR(20) NOT NULL DEFAULT 'event',\n\
+  link_target VARCHAR(200),\n\
+  position INTEGER DEFAULT 0,\n\
+  active_from TIMESTAMP,\n\
+  active_until TIMESTAMP,\n\
+  created_by INTEGER REFERENCES users(id),\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  updated_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_banners_active ON banners(active_from, active_until, position);\n\
+\n\
+-- Historique des broadcasts push (modération + audit + ne pas spammer).\n\
+CREATE TABLE IF NOT EXISTS broadcasts (\n\
+  id SERIAL PRIMARY KEY,\n\
+  title VARCHAR(120) NOT NULL,\n\
+  body VARCHAR(500) NOT NULL,\n\
+  segment VARCHAR(40) NOT NULL DEFAULT 'all',\n\
+  segment_value VARCHAR(100),\n\
+  recipients_count INTEGER DEFAULT 0,\n\
+  sent_count INTEGER DEFAULT 0,\n\
+  failed_count INTEGER DEFAULT 0,\n\
+  data JSONB,\n\
+  sent_by INTEGER REFERENCES users(id),\n\
+  sent_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_broadcasts_sent ON broadcasts(sent_at DESC);\n\
+\n\
+-- ============================================================\n\
+-- ADM-07 : Paramètres plateforme (clé/valeur typée)\n\
+-- ============================================================\n\
+-- Stockés en table KV pour pouvoir être édités sans deploy.\n\
+-- Valeurs JSON pour supporter int, decimal, string, bool, json.\n\
+CREATE TABLE IF NOT EXISTS app_settings (\n\
+  key VARCHAR(60) PRIMARY KEY,\n\
+  value JSONB NOT NULL,\n\
+  description TEXT,\n\
+  updated_by INTEGER REFERENCES users(id),\n\
+  updated_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+\n\
+-- Seed des paramètres par défaut (idempotent : ON CONFLICT DO NOTHING).\n\
+INSERT INTO app_settings (key, value, description) VALUES\n\
+  ('commission_rate', '0.06', 'Taux de commission Akwaba sur les billets vendus (0.06 = 6%)'),\n\
+  ('cinetpay_fee_rate', '0.015', 'Frais CinetPay estimés (~1.5%)'),\n\
+  ('escrow_hours', '48', 'Délai en heures avant qu''un payout devienne éligible (J+2 = 48h)'),\n\
+  ('refund_policy_default', '{\"more_than_48h\":1.0,\"between_24_and_48h\":0.7,\"less_than_24h\":0.0}', 'Politique de remboursement par défaut (proportion remboursée selon le délai avant événement)'),\n\
+  ('tva_rate', '0.18', 'TVA Côte d''Ivoire (18%, incluse dans le prix affiché)'),\n\
+  ('payout_review_threshold_amount', '500000', 'Montant FCFA au-dessus duquel un payout exige revue manuelle'),\n\
+  ('payout_review_refund_ratio', '0.10', 'Ratio de remboursements au-dessus duquel un payout est bloqué pour revue (0.10 = 10%)')\n\
+ON CONFLICT (key) DO NOTHING;\n\
 ";
 
 console.log('Migration en cours...');
@@ -143,6 +253,10 @@ pool.query(CREATE_TABLES)
     console.log('  - payments');
     console.log('  - device_tokens');
     console.log('  - admin_audit_log');
+    console.log('  - payouts (ADM-05)');
+    console.log('  - banners (ADM-06)');
+    console.log('  - broadcasts (ADM-06)');
+    console.log('  - app_settings (ADM-07)');
     process.exit(0);
   })
   .catch(function(err) {

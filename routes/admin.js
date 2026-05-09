@@ -6,6 +6,7 @@ var express = require('express');
 var router = express.Router();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
+var push = require('../services/push');
 
 // Pagination par défaut. Limite haute volontairement modeste pour
 // éviter qu'un admin ne charge accidentellement 10k lignes.
@@ -666,6 +667,712 @@ router.post('/payments/:id/manual-refund', function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur POST /admin/payments/:id/manual-refund:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// Payouts / Reversements organisateurs (ADM-05)
+// ============================================================
+
+// Helper : lit un setting numérique depuis app_settings (ou default si absent).
+function getSetting(key, defaultValue) {
+  return pool.query('SELECT value FROM app_settings WHERE key = $1', [key])
+    .then(function(r) {
+      if (r.rows.length === 0) return defaultValue;
+      // value est JSONB — soit un nombre soit un objet
+      var v = r.rows[0].value;
+      return v;
+    });
+}
+
+// GET /admin/payouts — Liste paginée des reversements
+// @query {string} status - 'all' | 'scheduled' | 'released' | 'blocked' | 'cancelled'
+// @query {number} organizer_id - filtrer par organisateur
+// @query {string} from, to - bornes ISO date sur scheduled_at
+router.get('/payouts', function(req, res) {
+  var status = req.query.status || 'all';
+  var organizerId = req.query.organizer_id ? parseInt(req.query.organizer_id) : null;
+  var from = req.query.from;
+  var to = req.query.to;
+  var pag = readPagination(req);
+
+  var clauses = [];
+  var params = [];
+
+  if (status !== 'all') {
+    params.push(status);
+    clauses.push('p.status = $' + params.length);
+  }
+  if (organizerId) {
+    params.push(organizerId);
+    clauses.push('p.organizer_id = $' + params.length);
+  }
+  if (from) { params.push(from); clauses.push('p.scheduled_at >= $' + params.length); }
+  if (to)   { params.push(to);   clauses.push('p.scheduled_at <= $' + params.length); }
+
+  var where = clauses.length > 0 ? ' WHERE ' + clauses.join(' AND ') : '';
+
+  var listSql =
+    'SELECT p.id, p.organizer_id, p.event_id, p.bookings_count, p.gross_amount, ' +
+    'p.commission_amount, p.cinetpay_fees, p.net_amount, p.status, ' +
+    'p.scheduled_at, p.released_at, p.created_at, ' +
+    'u.nom AS organizer_nom, u.prenom AS organizer_prenom, u.phone AS organizer_phone, ' +
+    'e.title AS event_title ' +
+    'FROM payouts p ' +
+    'LEFT JOIN users u ON u.id = p.organizer_id ' +
+    'LEFT JOIN events e ON e.id = p.event_id' + where +
+    ' ORDER BY p.created_at DESC LIMIT ' + pag.pageSize + ' OFFSET ' + pag.offset;
+
+  var countSql = 'SELECT COUNT(*)::int AS n FROM payouts p' + where;
+
+  // Counts par statut pour les compteurs UI (sidebar badge etc.)
+  var statusCountsSql =
+    "SELECT status, COUNT(*)::int AS n FROM payouts GROUP BY status";
+
+  Promise.all([pool.query(listSql, params), pool.query(countSql, params), pool.query(statusCountsSql)])
+    .then(function(results) {
+      var statusCounts = { scheduled: 0, released: 0, blocked: 0, cancelled: 0 };
+      results[2].rows.forEach(function(r) { statusCounts[r.status] = r.n; });
+
+      res.json({
+        success: true,
+        page: pag.page,
+        page_size: pag.pageSize,
+        total: results[1].rows[0].n,
+        status_counts: statusCounts,
+        payouts: results[0].rows.map(function(r) {
+          return {
+            id: r.id.toString(),
+            organizer: {
+              id: r.organizer_id.toString(),
+              nom: r.organizer_nom,
+              prenom: r.organizer_prenom,
+              phone: r.organizer_phone,
+            },
+            event: r.event_id ? { id: r.event_id.toString(), title: r.event_title } : null,
+            bookings_count: r.bookings_count,
+            gross_amount: parseInt(r.gross_amount) || 0,
+            commission_amount: parseInt(r.commission_amount) || 0,
+            cinetpay_fees: parseInt(r.cinetpay_fees) || 0,
+            net_amount: parseInt(r.net_amount) || 0,
+            status: r.status,
+            scheduled_at: r.scheduled_at,
+            released_at: r.released_at,
+            created_at: r.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/payouts:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/payouts/:id — Détail d'un reversement avec orga + event + payment account
+router.get('/payouts/:id', function(req, res) {
+  pool.query(
+    'SELECT p.*, ' +
+    'u.nom AS organizer_nom, u.prenom AS organizer_prenom, u.phone AS organizer_phone, ' +
+    'u.email AS organizer_email, u.payout_account, ' +
+    'e.title AS event_title, e.start_at AS event_start_at, e.lieu AS event_lieu, ' +
+    'r.nom AS released_by_nom, r.prenom AS released_by_prenom ' +
+    'FROM payouts p ' +
+    'LEFT JOIN users u ON u.id = p.organizer_id ' +
+    'LEFT JOIN events e ON e.id = p.event_id ' +
+    'LEFT JOIN users r ON r.id = p.released_by ' +
+    'WHERE p.id = $1',
+    [req.params.id]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Reversement non trouvé' });
+      }
+      var r = result.rows[0];
+      res.json({
+        success: true,
+        payout: {
+          id: r.id.toString(),
+          organizer: {
+            id: r.organizer_id.toString(),
+            nom: r.organizer_nom,
+            prenom: r.organizer_prenom,
+            phone: r.organizer_phone,
+            email: r.organizer_email,
+            payout_account: r.payout_account,
+          },
+          event: r.event_id ? {
+            id: r.event_id.toString(),
+            title: r.event_title,
+            start_at: r.event_start_at,
+            lieu: r.event_lieu,
+          } : null,
+          period_start: r.period_start,
+          period_end: r.period_end,
+          bookings_count: r.bookings_count,
+          gross_amount: parseInt(r.gross_amount) || 0,
+          commission_amount: parseInt(r.commission_amount) || 0,
+          cinetpay_fees: parseInt(r.cinetpay_fees) || 0,
+          net_amount: parseInt(r.net_amount) || 0,
+          status: r.status,
+          scheduled_at: r.scheduled_at,
+          released_at: r.released_at,
+          released_by: r.released_by ? {
+            id: r.released_by.toString(),
+            nom: r.released_by_nom,
+            prenom: r.released_by_prenom,
+          } : null,
+          block_reason: r.block_reason,
+          account_info: r.account_info,
+          notes: r.notes,
+          created_at: r.created_at,
+          updated_at: r.updated_at,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/payouts/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/events/:id/schedule-payout — Crée un reversement pour un event
+// Calcule gross/commission/fees/net depuis les bookings 'confirme' et insère un payout
+// 'scheduled' avec scheduled_at = end_at + escrow_hours (défaut 48h).
+router.post('/events/:id/schedule-payout', function(req, res) {
+  var eventId = req.params.id;
+
+  Promise.all([
+    pool.query(
+      'SELECT id, organizer_id, title, start_at, end_at FROM events WHERE id = $1',
+      [eventId]
+    ),
+    pool.query(
+      "SELECT COUNT(*)::int AS n, COALESCE(SUM(total_amount), 0)::bigint AS gross " +
+      "FROM bookings WHERE event_id = $1 AND statut = 'confirme'",
+      [eventId]
+    ),
+    pool.query(
+      "SELECT id FROM payouts WHERE event_id = $1 AND status != 'cancelled' LIMIT 1",
+      [eventId]
+    ),
+    getSetting('commission_rate', 0.06),
+    getSetting('cinetpay_fee_rate', 0.015),
+    getSetting('escrow_hours', 48),
+  ])
+    .then(function(results) {
+      if (results[0].rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Événement non trouvé' });
+      }
+      if (results[2].rows.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: 'Un reversement existe déjà pour cet événement',
+          existing_payout_id: results[2].rows[0].id.toString(),
+        });
+      }
+
+      var event = results[0].rows[0];
+      var stats = results[1].rows[0];
+      var gross = parseInt(stats.gross) || 0;
+      var bookingsCount = stats.n;
+
+      if (gross === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'Aucun booking confirmé sur cet événement, rien à reverser',
+        });
+      }
+      if (!event.organizer_id) {
+        return res.status(400).json({
+          success: false,
+          message: 'Événement sans organisateur défini',
+        });
+      }
+
+      var commissionRate = parseFloat(results[3]);
+      var feeRate = parseFloat(results[4]);
+      var escrowHours = parseInt(results[5]);
+
+      var commission = Math.ceil(gross * commissionRate);
+      var fees = Math.ceil(gross * feeRate);
+      var net = gross - commission - fees;
+
+      // scheduled_at = end_at (ou start_at si end_at null) + escrow
+      var basis = event.end_at || event.start_at;
+      var scheduledAt;
+      if (basis) {
+        scheduledAt = new Date(new Date(basis).getTime() + escrowHours * 3600 * 1000);
+      } else {
+        // Pas de date parsable : on schedule maintenant + escrow (admin pourra forcer release)
+        scheduledAt = new Date(Date.now() + escrowHours * 3600 * 1000);
+      }
+
+      return pool.query(
+        'INSERT INTO payouts (organizer_id, event_id, period_start, period_end, ' +
+        'bookings_count, gross_amount, commission_amount, cinetpay_fees, net_amount, ' +
+        "status, scheduled_at, notes) " +
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'scheduled', $10, $11) RETURNING id",
+        [
+          event.organizer_id, event.id,
+          event.start_at, event.end_at || event.start_at,
+          bookingsCount, gross, commission, fees, net,
+          scheduledAt,
+          'Reversement créé par admin pour l\'événement « ' + event.title + ' »',
+        ]
+      ).then(function(insRes) {
+        var payoutId = insRes.rows[0].id;
+        logAudit(req.admin.id, 'payout.schedule', 'payout', payoutId, {
+          event_id: event.id, gross: gross, net: net,
+        });
+        res.status(201).json({
+          success: true,
+          payout: { id: payoutId.toString(), gross_amount: gross, net_amount: net, scheduled_at: scheduledAt },
+        });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/events/:id/schedule-payout:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/payouts/:id/release — Marque le payout comme releasé.
+// Le virement réel mobile money/banque se fait via le back-office CinetPay
+// Payouts ou manuellement par l'équipe finance — cette route ne fait que tracer.
+// @body {string} notes - Note optionnelle
+router.post('/payouts/:id/release', function(req, res) {
+  var notes = (req.body.notes || '').trim();
+
+  pool.query(
+    'SELECT p.id, p.status, p.organizer_id, p.net_amount, u.payout_account ' +
+    'FROM payouts p LEFT JOIN users u ON u.id = p.organizer_id WHERE p.id = $1',
+    [req.params.id]
+  )
+    .then(function(r) {
+      if (r.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Reversement non trouvé' });
+      }
+      var p = r.rows[0];
+      if (p.status === 'released') {
+        return res.status(409).json({ success: false, message: 'Reversement déjà releasé' });
+      }
+      if (p.status === 'cancelled') {
+        return res.status(409).json({ success: false, message: 'Reversement annulé, impossible à releaser' });
+      }
+
+      // Snapshot du payout_account au moment du release (au cas où il change après).
+      var accountSnapshot = p.payout_account;
+
+      return pool.query(
+        "UPDATE payouts SET status = 'released', released_at = NOW(), released_by = $1, " +
+        'account_info = $2, notes = COALESCE($3, notes), updated_at = NOW() WHERE id = $4 RETURNING id',
+        [req.admin.id, accountSnapshot, notes || null, req.params.id]
+      ).then(function(upd) {
+        logAudit(req.admin.id, 'payout.release', 'payout', upd.rows[0].id, {
+          net_amount: parseInt(p.net_amount),
+          account: accountSnapshot,
+        });
+        res.json({ success: true, payout: { id: upd.rows[0].id.toString(), status: 'released' } });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/payouts/:id/release:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/payouts/:id/block — Bloque un reversement suspect avec raison
+// @body {string} reason
+router.post('/payouts/:id/block', function(req, res) {
+  var reason = (req.body.reason || '').trim();
+  if (!reason) {
+    return res.status(400).json({ success: false, message: 'Raison du blocage requise' });
+  }
+
+  pool.query(
+    "UPDATE payouts SET status = 'blocked', block_reason = $1, updated_at = NOW() " +
+    "WHERE id = $2 AND status IN ('scheduled') RETURNING id",
+    [reason, req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(409).json({
+          success: false,
+          message: 'Reversement non trouvé ou déjà releasé/annulé',
+        });
+      }
+      logAudit(req.admin.id, 'payout.block', 'payout', r.rows[0].id, { reason: reason });
+      res.json({ success: true, payout: { id: r.rows[0].id.toString(), status: 'blocked' } });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/payouts/:id/block:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/payouts/:id/unblock — Débloque (remet en 'scheduled')
+router.post('/payouts/:id/unblock', function(req, res) {
+  pool.query(
+    "UPDATE payouts SET status = 'scheduled', block_reason = NULL, updated_at = NOW() " +
+    "WHERE id = $1 AND status = 'blocked' RETURNING id",
+    [req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(409).json({ success: false, message: 'Reversement non bloqué ou inexistant' });
+      }
+      logAudit(req.admin.id, 'payout.unblock', 'payout', r.rows[0].id, null);
+      res.json({ success: true, payout: { id: r.rows[0].id.toString(), status: 'scheduled' } });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/payouts/:id/unblock:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// Marketing : banners + featured events + broadcasts (ADM-06)
+// ============================================================
+
+// GET /admin/banners — Liste toutes les bannières (actives + futures + expirées)
+router.get('/banners', function(req, res) {
+  pool.query(
+    'SELECT id, title, subtitle, image_url, link_type, link_target, position, ' +
+    'active_from, active_until, created_at FROM banners ORDER BY position ASC, created_at DESC'
+  )
+    .then(function(result) {
+      res.json({
+        success: true,
+        banners: result.rows.map(function(r) {
+          return {
+            id: r.id.toString(),
+            title: r.title,
+            subtitle: r.subtitle,
+            image_url: r.image_url,
+            link_type: r.link_type,
+            link_target: r.link_target,
+            position: r.position,
+            active_from: r.active_from,
+            active_until: r.active_until,
+            created_at: r.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/banners:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/banners — Crée une bannière
+// @body {string} title, {string} image_url, {string} link_type ('event'|'url'|'category'),
+//        {string} link_target, {number} position, {string?} subtitle, {string?} active_from, active_until
+router.post('/banners', function(req, res) {
+  var b = req.body;
+  if (!b.title || !b.image_url) {
+    return res.status(400).json({ success: false, message: 'title et image_url requis' });
+  }
+  pool.query(
+    'INSERT INTO banners (title, subtitle, image_url, link_type, link_target, position, ' +
+    'active_from, active_until, created_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id',
+    [
+      b.title, b.subtitle || null, b.image_url,
+      b.link_type || 'event', b.link_target || null,
+      parseInt(b.position) || 0,
+      b.active_from || null, b.active_until || null,
+      req.admin.id,
+    ]
+  )
+    .then(function(r) {
+      logAudit(req.admin.id, 'banner.create', 'banner', r.rows[0].id, { title: b.title });
+      res.status(201).json({ success: true, banner: { id: r.rows[0].id.toString() } });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/banners:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/banners/:id — Met à jour une bannière (champs partiels)
+router.patch('/banners/:id', function(req, res) {
+  var fields = [];
+  var params = [];
+  var allowed = ['title', 'subtitle', 'image_url', 'link_type', 'link_target',
+    'position', 'active_from', 'active_until'];
+  allowed.forEach(function(key) {
+    if (req.body[key] !== undefined) {
+      params.push(req.body[key]);
+      fields.push(key + ' = $' + params.length);
+    }
+  });
+  if (fields.length === 0) {
+    return res.status(400).json({ success: false, message: 'Aucun champ à modifier' });
+  }
+  params.push(req.params.id);
+  pool.query(
+    'UPDATE banners SET ' + fields.join(', ') + ', updated_at = NOW() ' +
+    'WHERE id = $' + params.length + ' RETURNING id',
+    params
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Bannière non trouvée' });
+      }
+      logAudit(req.admin.id, 'banner.update', 'banner', r.rows[0].id, null);
+      res.json({ success: true });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/banners/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// DELETE /admin/banners/:id — Supprime une bannière
+router.delete('/banners/:id', function(req, res) {
+  pool.query('DELETE FROM banners WHERE id = $1 RETURNING id', [req.params.id])
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Bannière non trouvée' });
+      }
+      logAudit(req.admin.id, 'banner.delete', 'banner', r.rows[0].id, null);
+      res.json({ success: true });
+    })
+    .catch(function(err) {
+      console.error('Erreur DELETE /admin/banners/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/events/:id/feature — Active/désactive le badge "À la une"
+// @body {boolean} is_featured, {string?} featured_until - ISO date (défaut: +7j)
+router.patch('/events/:id/feature', function(req, res) {
+  var isFeatured = !!req.body.is_featured;
+  var until = req.body.featured_until;
+  if (isFeatured && !until) {
+    until = new Date(Date.now() + 7 * 24 * 3600 * 1000); // défaut: 7 jours
+  }
+  pool.query(
+    'UPDATE events SET is_featured = $1, featured_until = $2, updated_at = NOW() ' +
+    'WHERE id = $3 RETURNING id, title, is_featured',
+    [isFeatured, isFeatured ? until : null, req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Événement non trouvé' });
+      }
+      logAudit(req.admin.id, isFeatured ? 'event.feature' : 'event.unfeature',
+        'event', r.rows[0].id, { until: until });
+      res.json({ success: true, event: { id: r.rows[0].id.toString(), is_featured: isFeatured } });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/events/:id/feature:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/notifications/broadcast — Envoie une notification push à un segment
+// @body {string} title, {string} body, {string} segment ('all'|'role'),
+//        {string?} segment_value, {object?} data
+router.post('/notifications/broadcast', function(req, res) {
+  var title = (req.body.title || '').trim();
+  var body = (req.body.body || '').trim();
+  var segment = req.body.segment || 'all';
+  var segmentValue = req.body.segment_value || null;
+  var data = req.body.data || {};
+
+  if (!title || !body) {
+    return res.status(400).json({ success: false, message: 'title et body requis' });
+  }
+  if (title.length > 120 || body.length > 500) {
+    return res.status(400).json({ success: false, message: 'title <= 120, body <= 500 chars' });
+  }
+  if (segment !== 'all' && segment !== 'role') {
+    return res.status(400).json({ success: false, message: 'segment doit être "all" ou "role"' });
+  }
+  if (segment === 'role' && !segmentValue) {
+    return res.status(400).json({ success: false, message: 'segment_value requis pour segment=role' });
+  }
+
+  push.notifySegment(segment, segmentValue, { title: title, body: body, data: data })
+    .then(function(stats) {
+      // Log dans la table broadcasts
+      return pool.query(
+        'INSERT INTO broadcasts (title, body, segment, segment_value, recipients_count, ' +
+        'sent_count, failed_count, data, sent_by) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id',
+        [title, body, segment, segmentValue,
+          stats.recipients_count, stats.sent_count, stats.failed_count,
+          JSON.stringify(data), req.admin.id]
+      ).then(function(r) {
+        logAudit(req.admin.id, 'broadcast.send', 'broadcast', r.rows[0].id, {
+          segment: segment, segment_value: segmentValue,
+          recipients: stats.recipients_count, sent: stats.sent_count,
+        });
+        res.status(201).json({
+          success: true,
+          broadcast: {
+            id: r.rows[0].id.toString(),
+            recipients_count: stats.recipients_count,
+            sent_count: stats.sent_count,
+            failed_count: stats.failed_count,
+          },
+        });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/notifications/broadcast:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/broadcasts — Historique des broadcasts envoyés
+router.get('/broadcasts', function(req, res) {
+  var pag = readPagination(req);
+  Promise.all([
+    pool.query(
+      'SELECT b.id, b.title, b.body, b.segment, b.segment_value, ' +
+      'b.recipients_count, b.sent_count, b.failed_count, b.sent_at, ' +
+      'u.nom AS sent_by_nom, u.prenom AS sent_by_prenom ' +
+      'FROM broadcasts b LEFT JOIN users u ON u.id = b.sent_by ' +
+      'ORDER BY b.sent_at DESC LIMIT ' + pag.pageSize + ' OFFSET ' + pag.offset
+    ),
+    pool.query('SELECT COUNT(*)::int AS n FROM broadcasts'),
+  ])
+    .then(function(results) {
+      res.json({
+        success: true,
+        page: pag.page,
+        page_size: pag.pageSize,
+        total: results[1].rows[0].n,
+        broadcasts: results[0].rows.map(function(r) {
+          return {
+            id: r.id.toString(),
+            title: r.title,
+            body: r.body,
+            segment: r.segment,
+            segment_value: r.segment_value,
+            recipients_count: r.recipients_count,
+            sent_count: r.sent_count,
+            failed_count: r.failed_count,
+            sent_at: r.sent_at,
+            sent_by: r.sent_by_nom ? r.sent_by_prenom + ' ' + r.sent_by_nom : null,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/broadcasts:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// Platform settings (ADM-07) — clé/valeur typée en JSONB
+// ============================================================
+
+// GET /admin/settings — Liste tous les paramètres plateforme
+router.get('/settings', function(req, res) {
+  pool.query(
+    'SELECT key, value, description, updated_at, ' +
+    '(SELECT prenom || \' \' || nom FROM users WHERE id = updated_by) AS updated_by_name ' +
+    'FROM app_settings ORDER BY key ASC'
+  )
+    .then(function(result) {
+      res.json({
+        success: true,
+        settings: result.rows.map(function(r) {
+          return {
+            key: r.key,
+            value: r.value,
+            description: r.description,
+            updated_at: r.updated_at,
+            updated_by_name: r.updated_by_name,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/settings:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/settings/:key — Met à jour la valeur d'un paramètre
+// @body {any} value - JSON quelconque (number, string, bool, object)
+router.patch('/settings/:key', function(req, res) {
+  if (req.body.value === undefined) {
+    return res.status(400).json({ success: false, message: 'value requis' });
+  }
+  // Validation basique selon la clé (évite de pousser n'importe quoi).
+  var key = req.params.key;
+  var value = req.body.value;
+  var validators = {
+    commission_rate: function(v) { return typeof v === 'number' && v >= 0 && v <= 1; },
+    cinetpay_fee_rate: function(v) { return typeof v === 'number' && v >= 0 && v <= 1; },
+    escrow_hours: function(v) { return typeof v === 'number' && v >= 0 && v <= 720; },
+    tva_rate: function(v) { return typeof v === 'number' && v >= 0 && v <= 1; },
+    payout_review_threshold_amount: function(v) { return typeof v === 'number' && v >= 0; },
+    payout_review_refund_ratio: function(v) { return typeof v === 'number' && v >= 0 && v <= 1; },
+    refund_policy_default: function(v) {
+      return v && typeof v === 'object'
+        && typeof v.more_than_48h === 'number'
+        && typeof v.between_24_and_48h === 'number'
+        && typeof v.less_than_24h === 'number';
+    },
+  };
+  if (validators[key] && !validators[key](value)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Valeur invalide pour la clé ' + key,
+    });
+  }
+
+  pool.query(
+    'UPDATE app_settings SET value = $1, updated_by = $2, updated_at = NOW() ' +
+    'WHERE key = $3 RETURNING key',
+    [JSON.stringify(value), req.admin.id, key]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Paramètre inconnu' });
+      }
+      logAudit(req.admin.id, 'setting.update', 'setting', key, { value: value });
+      res.json({ success: true });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/settings/:key:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/users/:id/payout-account — Définit le compte de reversement d'un orga
+// @body {object} payout_account - { provider, number, name, ...}
+router.patch('/users/:id/payout-account', function(req, res) {
+  var account = req.body.payout_account;
+  if (!account || typeof account !== 'object') {
+    return res.status(400).json({ success: false, message: 'payout_account requis (objet JSON)' });
+  }
+  if (!account.provider || !account.number || !account.name) {
+    return res.status(400).json({ success: false, message: 'provider, number, name obligatoires' });
+  }
+
+  pool.query(
+    "UPDATE users SET payout_account = $1, updated_at = NOW() WHERE id = $2 AND role = 'organisateur' RETURNING id",
+    [JSON.stringify(account), req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Organisateur non trouvé' });
+      }
+      logAudit(req.admin.id, 'user.payout_account_update', 'user', r.rows[0].id, {
+        provider: account.provider,
+      });
+      res.json({ success: true });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH payout-account:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
