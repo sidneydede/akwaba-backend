@@ -104,4 +104,12 @@ app.listen(PORT, function() {
     var schedulePayouts = require('./jobs/schedule-payouts');
     schedulePayouts.start();
   }
+
+  // Worker de rappels push J-1 et H-2 (NOTIF-01). Réduit les no-shows en
+  // ré-engageant les utilisateurs avant leur événement. Désactivable via
+  // DISABLE_EVENT_REMINDERS=true (utile en dev pour éviter de spammer).
+  if (process.env.DISABLE_EVENT_REMINDERS !== 'true') {
+    var eventReminders = require('./jobs/event-reminders');
+    eventReminders.start();
+  }
 });

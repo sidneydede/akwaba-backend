@@ -187,6 +187,16 @@ ALTER TABLE payouts ADD COLUMN IF NOT EXISTS transfer_data JSONB;\n\
 -- Format JSONB : { categories: [\"Festival\", \"Sport\", ...], lang?: \"fr\" }\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB DEFAULT '{}';\n\
 \n\
+-- BK-04 : annulation billet par l'utilisateur avec calcul refund selon délai.\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMP;\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_amount BIGINT;\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_ratio DECIMAL(4,3);\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;\n\
+\n\
+-- NOTIF-01 : flags de rappels push pour éviter les doublons de notifications.\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent_d1 BOOLEAN DEFAULT false;\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent_h2 BOOLEAN DEFAULT false;\n\
+\n\
 -- ============================================================\n\
 -- ADM-06 : Marketing (banners + featured + broadcasts)\n\
 -- ============================================================\n\

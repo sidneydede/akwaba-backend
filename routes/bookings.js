@@ -202,7 +202,8 @@ router.post('/', auth.authMiddleware, function(req, res) {
 router.get('/', auth.authMiddleware, function(req, res) {
   pool.query(
     'SELECT b.id, b.ref, b.quantity, b.total_amount, b.paiement_method, b.statut, b.created_at, ' +
-    'e.title, e.date, e.lieu, e.prix_display, e.emoji, e.color, e.category ' +
+    'b.cancelled_at, b.refund_amount, b.refund_ratio, b.cancellation_reason, ' +
+    'e.title, e.date, e.lieu, e.prix_display, e.emoji, e.color, e.category, e.start_at, e.image_url ' +
     'FROM bookings b JOIN events e ON b.event_id = e.id ' +
     'WHERE b.user_id = $1 ORDER BY b.created_at DESC',
     [req.userId]
@@ -220,14 +221,20 @@ router.get('/', auth.authMiddleware, function(req, res) {
           paiement: row.paiement_method,
           statut: row.statut,
           created_at: row.created_at,
+          cancelled_at: row.cancelled_at,
+          refund_amount: row.refund_amount != null ? parseInt(row.refund_amount) : null,
+          refund_ratio: row.refund_ratio != null ? parseFloat(row.refund_ratio) : null,
+          cancellation_reason: row.cancellation_reason,
           event: {
             title: row.title,
             date: row.date,
+            start_at: row.start_at,
             lieu: row.lieu,
             prix: row.prix_display,
             emoji: row.emoji,
             color: row.color,
-            category: row.category
+            category: row.category,
+            image_url: row.image_url
           }
         };
       });
@@ -370,6 +377,118 @@ router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(re
     })
     .catch(function(err) {
       console.error('Erreur POST /bookings/check-in:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /bookings/:id/cancel — Annulation par l'utilisateur (BK-04).
+// Politique de remboursement (lue depuis app_settings.refund_policy_default) :
+//   - >48h avant l'événement → 100%
+//   - 24-48h               → 70%
+//   - <24h ou passé        → 0%
+// Si event.start_at est NULL (legacy event sans timestamp parsable), on applique
+// la politique la plus généreuse (100%) — vaut mieux trop rembourser que créer
+// un litige sur la première annulation.
+//
+// Le remboursement réel CinetPay est fait manuellement via le back-office par
+// l'admin pour MVP (audit-log only). Une intégration CinetPay refund pourra
+// être branchée ici plus tard.
+router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
+  var bookingId = req.params.id;
+  var reason = (req.body.reason || '').trim();
+
+  pool.query(
+    'SELECT b.id, b.user_id, b.event_id, b.quantity, b.total_amount, b.statut, ' +
+    'e.title, e.start_at, e.organizer_id ' +
+    'FROM bookings b JOIN events e ON e.id = b.event_id ' +
+    'WHERE b.id = $1',
+    [bookingId]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Réservation non trouvée' });
+      }
+      var b = result.rows[0];
+      if (b.user_id !== req.userId) {
+        return res.status(403).json({ success: false, message: 'Cette réservation ne vous appartient pas' });
+      }
+      if (b.statut !== 'confirme' && b.statut !== 'en_attente') {
+        return res.status(409).json({
+          success: false,
+          message: 'Réservation déjà annulée, utilisée ou remboursée',
+        });
+      }
+
+      // Récupère la politique de remboursement (JSONB de la table app_settings).
+      return pool.query(
+        "SELECT value FROM app_settings WHERE key = 'refund_policy_default'"
+      ).then(function(polRes) {
+        var policy = polRes.rows.length > 0
+          ? polRes.rows[0].value
+          : { more_than_48h: 1.0, between_24_and_48h: 0.7, less_than_24h: 0.0 };
+
+        // Calcul du ratio selon le délai avant l'événement.
+        var ratio;
+        if (!b.start_at) {
+          // Pas de date parsable : on est généreux (100%).
+          ratio = 1.0;
+        } else {
+          var hoursUntil = (new Date(b.start_at).getTime() - Date.now()) / 3600000;
+          if (hoursUntil > 48) ratio = parseFloat(policy.more_than_48h);
+          else if (hoursUntil > 24) ratio = parseFloat(policy.between_24_and_48h);
+          else ratio = parseFloat(policy.less_than_24h);
+        }
+
+        var refundAmount = Math.floor(b.total_amount * ratio);
+
+        // Transaction : update booking + relâche les places.
+        return pool.query(
+          "UPDATE bookings SET statut = 'annule', cancelled_at = NOW(), " +
+          'refund_amount = $1, refund_ratio = $2, cancellation_reason = $3, ' +
+          'updated_at = NOW() WHERE id = $4 RETURNING id',
+          [refundAmount, ratio, reason || null, bookingId]
+        )
+          .then(function() {
+            return pool.query(
+              'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',
+              [b.quantity, b.event_id]
+            );
+          })
+          .then(function() {
+            // Notif user (toujours) + orga si refund > 0 (impact sur ses revenus).
+            push.notifyUser(b.user_id, {
+              title: 'Annulation enregistrée',
+              body: refundAmount > 0
+                ? '« ' + b.title + ' » — remboursement de ' + refundAmount.toLocaleString('fr-FR') + ' FCFA en cours'
+                : '« ' + b.title + ' » — annulation sans remboursement (délai dépassé)',
+              data: { type: 'booking_cancelled', bookingId: b.id.toString() },
+            });
+            if (b.organizer_id && b.organizer_id !== b.user_id && refundAmount > 0) {
+              push.notifyUser(b.organizer_id, {
+                title: 'Annulation client',
+                body: b.quantity + ' billet' + (b.quantity > 1 ? 's' : '') + ' annulé' +
+                  (b.quantity > 1 ? 's' : '') + ' sur « ' + b.title + ' »',
+                data: { type: 'booking_cancelled_for_orga', bookingId: b.id.toString() },
+              });
+            }
+
+            res.json({
+              success: true,
+              cancellation: {
+                booking_id: bookingId,
+                refund_amount: refundAmount,
+                refund_ratio: ratio,
+                refund_status: refundAmount > 0 ? 'pending_manual' : 'no_refund',
+                message: refundAmount > 0
+                  ? 'Annulation enregistrée. Remboursement de ' + refundAmount.toLocaleString('fr-FR') + ' FCFA traité sous 5 jours ouvrés.'
+                  : 'Annulation enregistrée. Aucun remboursement applicable selon la politique (moins de 24h avant l\'événement).',
+              },
+            });
+          });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /bookings/:id/cancel:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });

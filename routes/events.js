@@ -187,8 +187,41 @@ router.get('/:id', function(req, res) {
     });
 });
 
+// POST /events/upload-signature — Génère une signature Cloudinary pour upload direct
+// par un organisateur depuis l'app mobile. Le fichier va direct chez Cloudinary,
+// pas par notre backend (économise bandwidth Render). Auth orga obligatoire.
+router.post('/upload-signature', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var crypto = require('crypto');
+  var apiKey = process.env.CLOUDINARY_API_KEY;
+  var apiSecret = process.env.CLOUDINARY_API_SECRET;
+  var cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+
+  if (!apiKey || !apiSecret || !cloudName) {
+    return res.status(503).json({
+      success: false,
+      message: 'Cloudinary non configuré côté serveur',
+    });
+  }
+
+  // Folder organisé par orga pour faciliter les permissions/cleanup futurs.
+  var folder = 'akwaba/events/' + req.userId;
+  var timestamp = Math.floor(Date.now() / 1000);
+  var paramsToSign = 'folder=' + folder + '&timestamp=' + timestamp;
+  var signature = crypto.createHash('sha1').update(paramsToSign + apiSecret).digest('hex');
+
+  res.json({
+    success: true,
+    signature: signature,
+    timestamp: timestamp,
+    api_key: apiKey,
+    cloud_name: cloudName,
+    folder: folder,
+    upload_url: 'https://api.cloudinary.com/v1_1/' + cloudName + '/image/upload',
+  });
+});
+
 // POST /events — Créer un événement (organisateurs uniquement)
-// @body {string} title, description, category, date, lieu, prix, emoji, color
+// @body {string} title, description, category, date, lieu, prix, emoji, color, image_url
 router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
   var body = req.body;
 
@@ -209,8 +242,21 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
   if (latitude !== null && isNaN(latitude)) latitude = null;
   if (longitude !== null && isNaN(longitude)) longitude = null;
 
+  // start_at / end_at (TIMESTAMP) : nécessaires pour les calculs J+2 escrow,
+  // refund 48h/24h, et rappels push. Optionnels — la string `date` reste affichée.
+  var startAt = null;
+  if (body.start_at) {
+    var d = new Date(body.start_at);
+    if (!isNaN(d.getTime())) startAt = d;
+  }
+  var endAt = null;
+  if (body.end_at) {
+    var de = new Date(body.end_at);
+    if (!isNaN(de.getTime())) endAt = de;
+  }
+
   pool.query(
-    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes, organizer_id, latitude, longitude) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15) RETURNING *',
+    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes, organizer_id, latitude, longitude, start_at, end_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, $17) RETURNING *',
     [
       body.title,
       body.description || '',
@@ -226,7 +272,9 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
       placesTotal,
       req.userId,
       latitude,
-      longitude
+      longitude,
+      startAt,
+      endAt
     ]
   )
     .then(function(result) {
@@ -303,6 +351,18 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         if (!isNaN(parsedLng)) longitude = parsedLng;
       }
 
+      // Parse start_at / end_at si fournis (sinon COALESCE garde l'ancienne valeur).
+      var newStartAt = null;
+      if (body.start_at) {
+        var ds = new Date(body.start_at);
+        if (!isNaN(ds.getTime())) newStartAt = ds;
+      }
+      var newEndAt = null;
+      if (body.end_at) {
+        var dee = new Date(body.end_at);
+        if (!isNaN(dee.getTime())) newEndAt = dee;
+      }
+
       return pool.query(
         'UPDATE events SET ' +
         'title = COALESCE($1, title), ' +
@@ -320,8 +380,10 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         'places_restantes = COALESCE($13, places_restantes), ' +
         'latitude = COALESCE($14, latitude), ' +
         'longitude = COALESCE($15, longitude), ' +
+        'start_at = COALESCE($16, start_at), ' +
+        'end_at = COALESCE($17, end_at), ' +
         'updated_at = NOW() ' +
-        'WHERE id = $16 RETURNING *',
+        'WHERE id = $18 RETURNING *',
         [
           body.title || null,
           body.description !== undefined ? body.description : null,
@@ -338,6 +400,8 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
           newPlacesRestantes,
           latitude,
           longitude,
+          newStartAt,
+          newEndAt,
           eventId
         ]
       )
