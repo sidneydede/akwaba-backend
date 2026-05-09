@@ -110,8 +110,15 @@ router.post('/', auth.authMiddleware, function(req, res) {
             .then(function(userResult) {
               var user = userResult.rows[0] || {};
 
-              // Si l'event est gratuit (prix = 0), on confirme directement sans CinetPay.
-              if (totalAmount === 0) {
+              // Mode MOCK_PAYMENTS=true : on bypass CinetPay et on confirme direct.
+              // Utile en phase test avant que les credentials CinetPay merchant soient
+              // disponibles. À DÉSACTIVER en prod (sinon les billets sont confirmés
+              // sans débit réel).
+              var isMockMode = process.env.MOCK_PAYMENTS === 'true';
+
+              // Si l'event est gratuit (prix = 0) OU si on est en mock mode, confirme
+              // directement sans appeler CinetPay.
+              if (totalAmount === 0 || isMockMode) {
                 return pool.query(
                   "UPDATE bookings SET statut = 'confirme', updated_at = NOW() WHERE id = $1 RETURNING id",
                   [booking.id]
@@ -119,17 +126,20 @@ router.post('/', auth.authMiddleware, function(req, res) {
                   notifyBookingConfirmed(booking.id);
                   return res.status(201).json({
                     success: true,
-                    message: 'Réservation gratuite confirmée',
+                    message: isMockMode
+                      ? 'Réservation confirmée (MODE MOCK — aucun paiement réel)'
+                      : 'Réservation gratuite confirmée',
                     booking: {
                       id: booking.id.toString(),
                       eventId: booking.event_id.toString(),
                       ref: booking.ref,
                       qr_payload: qr.signRef(booking.ref),
                       quantity: booking.quantity,
-                      total_amount: 0,
-                      paiement: 'gratuit',
+                      total_amount: totalAmount,
+                      paiement: isMockMode ? 'mock' : 'gratuit',
                       statut: 'confirme',
                       payment_url: null,
+                      mock: isMockMode || undefined,
                       createdAt: booking.created_at
                     }
                   });
