@@ -91,6 +91,20 @@ function verifyTransactionWithApi(transactionId) {
     });
 }
 
+// Normalise un numéro vers le format international E.164 attendu par CinetPay.
+// Ex : "0787906706" → "+2250787906706", "2250787906706" → "+2250787906706".
+// CinetPay code 624 vient souvent d'un numéro non-international qu'ils n'arrivent
+// pas à valider auprès des opérateurs mobile money.
+function normalizePhone(phone) {
+  if (!phone) return '';
+  var s = String(phone).trim().replace(/\s/g, '');
+  if (s.startsWith('+225')) return s;
+  if (s.startsWith('225')) return '+' + s;
+  if (s.startsWith('+')) return s;
+  if (s.startsWith('0')) return '+225' + s.substring(1);
+  return '+225' + s;
+}
+
 // Initie un paiement CinetPay et retourne l'URL de la page de paiement.
 // On utilise la ref booking comme transaction_id : c'est unique, traçable, et nous évite
 // d'avoir à mapper transaction_id → booking_id côté webhook.
@@ -106,17 +120,23 @@ function initPayment(params) {
     return Promise.reject(new Error('CINETPAY_API_KEY ou CINETPAY_SITE_ID manquant'));
   }
 
+  // site_id doit être un entier (les exemples officiels CinetPay le passent en number).
+  var siteId = parseInt(CINETPAY_SITE_ID, 10);
+  if (isNaN(siteId)) {
+    return Promise.reject(new Error('CINETPAY_SITE_ID doit être un entier numérique'));
+  }
+
   var body = {
     apikey: CINETPAY_API_KEY,
-    site_id: CINETPAY_SITE_ID,
+    site_id: siteId,
     transaction_id: params.ref,
-    amount: params.amount,
+    amount: parseInt(params.amount, 10),
     currency: 'XOF',
     description: params.description || 'Billet Akwaba',
     customer_id: String(params.customer.id),
     customer_name: params.customer.name || 'Akwaba',
     customer_surname: params.customer.surname || 'Client',
-    customer_phone_number: params.customer.phone || '',
+    customer_phone_number: normalizePhone(params.customer.phone),
     customer_email: params.customer.email || 'client@akwaba.ci',
     customer_address: 'Abidjan',
     customer_city: 'Abidjan',
