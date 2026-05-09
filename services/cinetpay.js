@@ -138,6 +138,20 @@ function initPayment(params) {
     .then(function(json) {
       var data = json.data || {};
       var ok = json.code === '201' && data.payment_url;
+      // Log détaillé en cas d'échec — sans ça on n'a aucune visibilité sur ce
+      // que CinetPay reproche (code générique 624 / UNKNOWN_ERROR fréquent).
+      if (!ok) {
+        console.error('[cinetpay] init refusé. Payload envoyé :', JSON.stringify({
+          ref: body.transaction_id,
+          amount: body.amount,
+          phone: body.customer_phone_number,
+          email: body.customer_email,
+          notify_url: body.notify_url,
+          return_url: body.return_url,
+          channels: body.channels,
+        }));
+        console.error('[cinetpay] réponse :', JSON.stringify(json));
+      }
       return {
         ok: ok,
         payment_url: data.payment_url,

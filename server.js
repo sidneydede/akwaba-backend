@@ -60,6 +60,31 @@ app.get('/', function(req, res) {
   });
 });
 
+// Page de retour CinetPay : où les utilisateurs atterrissent après le paiement
+// (success ou cancel). HTML simple — l'app mobile ferme cet onglet et fait un
+// polling sur /payments/verify. Doit être HTTPS joignable sinon CinetPay refuse
+// d'initier le paiement (code 624). À remplacer par un vrai écran web quand
+// akwaba.ci sera déployé.
+app.get('/payment-success', function(req, res) {
+  var transId = req.query.transaction_id || '';
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.send(
+    '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">' +
+    '<title>Paiement Akwaba</title>' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<style>body{font-family:system-ui,sans-serif;background:#0E0B08;color:#F4EBDD;' +
+    'display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+    'min-height:100vh;margin:0;padding:24px;text-align:center}' +
+    'h1{color:#D85A2C;font-size:32px;margin:0 0 16px}p{color:rgba(244,235,221,0.65);max-width:480px;line-height:1.5}' +
+    'code{background:#161210;padding:6px 10px;border-radius:6px;font-size:12px;color:#E8A33D;display:inline-block;margin-top:12px}</style>' +
+    '</head><body>' +
+    '<h1>Paiement traité</h1>' +
+    '<p>Tu peux fermer cet onglet et retourner dans l\'application Akwaba pour voir ton billet.</p>' +
+    (transId ? '<code>Réf : ' + String(transId).replace(/[^A-Za-z0-9.-]/g, '') + '</code>' : '') +
+    '</body></html>'
+  );
+});
+
 // Routes API
 app.use('/auth', authRoutes);
 app.use('/events', eventsRoutes);
