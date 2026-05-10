@@ -103,6 +103,101 @@ router.get('/', function(req, res) {
     });
 });
 
+// GET /events/recommended — Liste personnalisée "Pour toi" (REC-01 v1 stub).
+//
+// V1 stub : pas de vraie ML, juste un mix popularité (nb de bookings confirmés)
+// + signal "chaud" (mis à la main par les orgas) + filtre par catégories
+// préférées si le user en a définies dans /auth/me/preferences.
+//
+// Auth optionnelle : si token présent on lit les préférences pour personnaliser,
+// sinon on retourne le top global. Pas d'erreur 401 pour un anonyme.
+//
+// V2 (besoin de volume) : score basé sur les events vus, billets achetés,
+// événements similaires aux favoris, etc.
+router.get('/recommended', function(req, res) {
+  // Auth optionnelle : lecture du token si présent, mais on accepte les anonymes.
+  var userId = null;
+  var authHeader = req.headers.authorization;
+  if (authHeader && authHeader.indexOf('Bearer ') === 0) {
+    userId = auth.decodeToken(authHeader.replace('Bearer ', ''));
+  }
+
+  var prefCategories = []; // partagé via closure entre les deux .then
+
+  var prefPromise = userId
+    ? pool.query('SELECT preferences FROM users WHERE id = $1', [userId])
+    : Promise.resolve({ rows: [] });
+
+  prefPromise
+    .then(function(userResult) {
+      if (userResult.rows.length > 0) {
+        var prefs = userResult.rows[0].preferences || {};
+        if (Array.isArray(prefs.categories)) {
+          prefCategories = prefs.categories.filter(function(c) {
+            return typeof c === 'string' && c.length > 0;
+          });
+        }
+      }
+
+      // Popularity = nb de bookings actifs (confirmés ou déjà utilisés).
+      // Sous-requête plutôt que JOIN/GROUP BY pour éviter les bookings sans event.
+      var selectCols = 'e.id, e.title, e.description, e.category, e.date, e.lieu, ' +
+        'e.prix, e.prix_display, e.emoji, e.color, e.chaud, e.image_url, ' +
+        'e.places_total, e.places_restantes, e.latitude, e.longitude, ' +
+        "(SELECT COUNT(*)::int FROM bookings b WHERE b.event_id = e.id " +
+        "AND b.statut IN ('confirme', 'utilise')) AS popularity";
+
+      var sql, params;
+      if (prefCategories.length > 0) {
+        // Personnalisé : on filtre par les catégories préférées.
+        sql = 'SELECT ' + selectCols + ' FROM events e ' +
+          "WHERE e.status = 'approved' AND LOWER(e.category) = ANY($1::text[]) " +
+          'ORDER BY e.chaud DESC, popularity DESC, e.created_at DESC LIMIT 20';
+        params = [prefCategories.map(function(c) { return c.toLowerCase(); })];
+      } else {
+        // Anonyme ou sans préférences : top global.
+        sql = 'SELECT ' + selectCols + ' FROM events e ' +
+          "WHERE e.status = 'approved' " +
+          'ORDER BY e.chaud DESC, popularity DESC, e.created_at DESC LIMIT 20';
+        params = [];
+      }
+
+      return pool.query(sql, params);
+    })
+    .then(function(result) {
+      var events = result.rows.map(function(row) {
+        return {
+          id: row.id.toString(),
+          title: row.title,
+          description: row.description,
+          category: row.category,
+          date: row.date,
+          lieu: row.lieu,
+          prix: row.prix_display,
+          prix_num: row.prix,
+          emoji: row.emoji,
+          color: row.color,
+          chaud: row.chaud,
+          image_url: row.image_url,
+          places_total: row.places_total,
+          places_restantes: row.places_restantes,
+          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          popularity: row.popularity || 0,
+        };
+      });
+      res.json({
+        success: true,
+        events: events,
+        personalized: prefCategories.length > 0,
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /events/recommended:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // GET /events/mine — Liste les événements créés par l'organisateur connecté
 // Inclut places_vendues (places_total - places_restantes) et revenue (somme des bookings 'confirme').
 router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
