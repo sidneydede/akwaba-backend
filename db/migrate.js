@@ -261,6 +261,22 @@ INSERT INTO app_settings (key, value, description) VALUES\n\
   ('payout_review_threshold_amount', '500000', 'Montant FCFA au-dessus duquel un payout exige revue manuelle'),\n\
   ('payout_review_refund_ratio', '0.10', 'Ratio de remboursements au-dessus duquel un payout est bloqué pour revue (0.10 = 10%)')\n\
 ON CONFLICT (key) DO NOTHING;\n\
+\n\
+-- ============================================================\n\
+-- FAV-01 : Favoris utilisateur\n\
+-- ============================================================\n\
+-- Un user peut mettre 0..N events en favori. Couple unique pour empêcher\n\
+-- les doublons. ON DELETE CASCADE pour garbage collect quand un user ou un\n\
+-- event est supprimé.\n\
+CREATE TABLE IF NOT EXISTS favorites (\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  PRIMARY KEY (user_id, event_id)\n\
+);\n\
+\n\
+CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_favorites_event ON favorites(event_id);\n\
 ";
 
 console.log('Migration en cours...');
@@ -278,6 +294,7 @@ pool.query(CREATE_TABLES)
     console.log('  - banners (ADM-06)');
     console.log('  - broadcasts (ADM-06)');
     console.log('  - app_settings (ADM-07)');
+    console.log('  - favorites (FAV-01)');
     process.exit(0);
   })
   .catch(function(err) {

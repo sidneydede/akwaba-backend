@@ -25,6 +25,7 @@ var paymentsRoutes = require('./routes/payments');
 var devicesRoutes = require('./routes/devices');
 var adminRoutes = require('./routes/admin');
 var bannersRoutes = require('./routes/banners');
+var favoritesRoutes = require('./routes/favorites');
 
 var app = express();
 var PORT = process.env.PORT || 3000;
@@ -93,6 +94,7 @@ app.use('/payments', paymentsRoutes);
 app.use('/devices', devicesRoutes);
 app.use('/admin', adminRoutes);
 app.use('/banners', bannersRoutes);
+app.use('/favorites', favoritesRoutes);
 
 // Sentry error handler — DOIT être après toutes les routes mais avant
 // les autres middlewares de gestion d'erreur. Capture toute exception non gérée.
