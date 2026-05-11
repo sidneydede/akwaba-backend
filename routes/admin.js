@@ -8,6 +8,7 @@ var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var push = require('../services/push');
 var cinetpay = require('../services/cinetpay');
+var followsRouter = require('./follows');
 
 // Pagination par défaut. Limite haute volontairement modeste pour
 // éviter qu'un admin ne charge accidentellement 10k lignes.
@@ -311,6 +312,10 @@ router.patch('/events/:id/approve', function(req, res) {
         return res.status(404).json({ success: false, message: 'Événement non trouvé' });
       }
       logAudit(req.admin.id, 'event.approve', 'event', result.rows[0].id, { title: result.rows[0].title });
+      // FOLLOW-01 : push notif aux followers de l'orga (best effort, ne bloque pas).
+      // Idempotent via flag events.followers_notified_at — si admin reject puis re-approve,
+      // pas de re-notif.
+      followsRouter.notifyFollowersOfNewEvent(result.rows[0].id);
       res.json({ success: true, event: { id: result.rows[0].id.toString(), status: 'approved' } });
     })
     .catch(function(err) {

@@ -337,6 +337,27 @@ CREATE TABLE IF NOT EXISTS referrals (\n\
   CHECK (parrain_id != filleul_id)\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_referrals_parrain ON referrals(parrain_id);\n\
+\n\
+-- ============================================================\n\
+-- FOLLOW-01 : Suivre un organisateur + push notif perso\n\
+-- ============================================================\n\
+-- Push notif au follower quand un event de l'orga suivi devient 'approved'\n\
+-- (hook dans PATCH /admin/events/:id/approve, cf. routes/admin.js).\n\
+CREATE TABLE IF NOT EXISTS follows (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  organisateur_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  UNIQUE (user_id, organisateur_id),\n\
+  CHECK (user_id != organisateur_id)\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_follows_user ON follows(user_id);\n\
+CREATE INDEX IF NOT EXISTS idx_follows_orga ON follows(organisateur_id);\n\
+\n\
+-- Anti double-push : flag sur events pour ne notifier les followers QU'UNE\n\
+-- fois (premier passage status='approved'). Si admin reject puis re-approve,\n\
+-- on ne re-notifie pas.\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS followers_notified_at TIMESTAMP;\n\
 ";
 
 console.log('Migration en cours...');
