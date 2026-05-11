@@ -162,4 +162,12 @@ app.listen(PORT, function() {
     var eventReminders = require('./jobs/event-reminders');
     eventReminders.start();
   }
+
+  // Worker du digest quotidien (ADM-DIGEST). Tick toutes les 10 min, envoie
+  // le digest à 8h UTC max 1x/jour. RESEND_API_KEY requis pour l'email ;
+  // sans la var, le digest est généré et stocké en DB mais email skip.
+  if (process.env.DISABLE_ADMIN_DIGEST !== 'true') {
+    var adminDigest = require('./jobs/admin-digest');
+    adminDigest.start();
+  }
 });

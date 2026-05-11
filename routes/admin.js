@@ -1697,6 +1697,58 @@ router.patch('/users/:id/payout-account', function(req, res) {
 });
 
 // ============================================================
+// ADM-DIGEST : Trigger manuel du digest quotidien
+// ============================================================
+
+// POST /admin/digest/send-now — Force la génération + envoi du digest J-1
+// immédiatement (au lieu d'attendre 8h UTC). Utile en debug ou si le cron
+// a manqué la fenêtre (Render free tier sleep).
+router.post('/digest/send-now', function(req, res) {
+  var digest = require('../jobs/admin-digest');
+  digest.sendDigestForToday()
+    .then(function(result) {
+      logAudit(req.admin.id, 'admin.digest.manual_send', null, null, result);
+      res.json({ success: true, result: result });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/digest/send-now:', err.message);
+      res.status(500).json({ success: false, message: err.message });
+    });
+});
+
+// GET /admin/digest/latest — Renvoie le dernier digest généré (data + html).
+// Pratique pour preview côté UI sans devoir attendre / forcer un envoi.
+router.get('/digest/latest', function(req, res) {
+  pool.query(
+    'SELECT id, digest_date, data, html, email_sent_at, email_recipients, email_error, created_at ' +
+    'FROM admin_digests ORDER BY digest_date DESC LIMIT 1'
+  )
+    .then(function(r) {
+      if (r.rows.length === 0) {
+        return res.json({ success: true, digest: null });
+      }
+      var row = r.rows[0];
+      res.json({
+        success: true,
+        digest: {
+          id: row.id.toString(),
+          digest_date: row.digest_date,
+          data: row.data,
+          html: row.html,
+          email_sent_at: row.email_sent_at,
+          email_recipients: row.email_recipients,
+          email_error: row.email_error,
+          created_at: row.created_at,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/digest/latest:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-SEARCH : Recherche globale Cmd+K
 // ============================================================
 // Recherche en parallèle dans 4 tables (users / events / bookings / payments).

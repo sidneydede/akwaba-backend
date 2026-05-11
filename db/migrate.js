@@ -427,6 +427,25 @@ CREATE INDEX IF NOT EXISTS idx_event_staff_event ON event_staff(event_id);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret VARCHAR(64);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled_at TIMESTAMP;\n\
+\n\
+-- ============================================================\n\
+-- ADM-DIGEST : Digest quotidien automatique envoyé aux admins\n\
+-- ============================================================\n\
+-- Un digest = un instantané des metrics J-1 + flags d'anomalies, généré par\n\
+-- le cron jobs/admin-digest.js chaque jour à 8h UTC. Stocké en DB + envoyé\n\
+-- par email (si RESEND_API_KEY configuré). UNIQUE sur digest_date pour éviter\n\
+-- les doublons si le cron tick plusieurs fois dans la journée.\n\
+CREATE TABLE IF NOT EXISTS admin_digests (\n\
+  id SERIAL PRIMARY KEY,\n\
+  digest_date DATE UNIQUE NOT NULL,\n\
+  data JSONB NOT NULL,\n\
+  html TEXT NOT NULL,\n\
+  email_sent_at TIMESTAMP,\n\
+  email_recipients TEXT[],\n\
+  email_error TEXT,\n\
+  created_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_admin_digests_date ON admin_digests(digest_date DESC);\n\
 ";
 
 console.log('Migration en cours...');
