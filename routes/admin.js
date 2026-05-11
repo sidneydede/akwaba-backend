@@ -1697,6 +1697,147 @@ router.patch('/users/:id/payout-account', function(req, res) {
 });
 
 // ============================================================
+// ADM-FINANCE : Dashboard financier
+// ============================================================
+// Vue agrégée pour le pilotage cash : mois courant vs précédent, à reverser,
+// commissions, refunds, breakdown méthodes, série quotidienne 30j.
+
+router.get('/finance', function(req, res) {
+  Promise.all([
+    // 1. Bookings confirmed : mois courant + précédent
+    pool.query(
+      "SELECT " +
+      "COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW()))::int AS bookings_this, " +
+      "COALESCE(SUM(total_amount) FILTER (WHERE created_at >= date_trunc('month', NOW())), 0)::bigint AS revenue_this, " +
+      "COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
+      "  AND created_at < date_trunc('month', NOW()))::int AS bookings_prev, " +
+      "COALESCE(SUM(total_amount) FILTER (WHERE created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
+      "  AND created_at < date_trunc('month', NOW())), 0)::bigint AS revenue_prev " +
+      "FROM bookings WHERE statut = 'confirme'"
+    ),
+    // 2. Payouts par statut : à reverser (scheduled + blocked) et déjà reversé ce mois
+    pool.query(
+      "SELECT " +
+      "COUNT(*) FILTER (WHERE status = 'scheduled')::int AS scheduled_count, " +
+      "COALESCE(SUM(net_amount) FILTER (WHERE status = 'scheduled'), 0)::bigint AS scheduled_amount, " +
+      "COUNT(*) FILTER (WHERE status = 'blocked')::int AS blocked_count, " +
+      "COALESCE(SUM(net_amount) FILTER (WHERE status = 'blocked'), 0)::bigint AS blocked_amount, " +
+      "COUNT(*) FILTER (WHERE status = 'released' AND released_at >= date_trunc('month', NOW()))::int AS released_count_this, " +
+      "COALESCE(SUM(net_amount) FILTER (WHERE status = 'released' AND released_at >= date_trunc('month', NOW())), 0)::bigint AS released_amount_this " +
+      'FROM payouts'
+    ),
+    // 3. Refunds ce mois
+    pool.query(
+      'SELECT COUNT(*)::int AS count, ' +
+      'COALESCE(SUM(refund_amount), 0)::bigint AS amount ' +
+      'FROM bookings WHERE cancelled_at IS NOT NULL ' +
+      "AND cancelled_at >= date_trunc('month', NOW())"
+    ),
+    // 4. Breakdown par méthode (paiements ACCEPTED ce mois)
+    pool.query(
+      "SELECT COALESCE(p.method, 'unknown') AS method, " +
+      'COUNT(*)::int AS count, ' +
+      'COALESCE(SUM(p.amount), 0)::bigint AS amount ' +
+      'FROM payments p ' +
+      "WHERE p.created_at >= date_trunc('month', NOW()) " +
+      "AND p.status = 'ACCEPTED' " +
+      'GROUP BY p.method ORDER BY amount DESC'
+    ),
+    // 5. Revenue quotidien 30 derniers jours (line chart)
+    pool.query(
+      'SELECT DATE(created_at) AS day, ' +
+      'COUNT(*)::int AS count, ' +
+      'COALESCE(SUM(total_amount), 0)::bigint AS revenue ' +
+      'FROM bookings ' +
+      "WHERE statut = 'confirme' " +
+      "AND created_at >= NOW() - INTERVAL '30 days' " +
+      'GROUP BY DATE(created_at) ORDER BY day ASC'
+    ),
+    // 6. Settings (taux commission + fees + TVA)
+    pool.query(
+      "SELECT key, value FROM app_settings " +
+      "WHERE key IN ('commission_rate', 'cinetpay_fee_rate', 'tva_rate')"
+    ),
+  ])
+    .then(function(r) {
+      var bk = r[0].rows[0];
+      var po = r[1].rows[0];
+      var rf = r[2].rows[0];
+      var methods = r[3].rows;
+      var daily = r[4].rows;
+      var settings = {};
+      r[5].rows.forEach(function(s) { settings[s.key] = parseFloat(s.value); });
+
+      var commissionRate = settings.commission_rate || 0.06;
+      var feeRate = settings.cinetpay_fee_rate || 0.015;
+      var tvaRate = settings.tva_rate || 0.18;
+
+      var revenueThis = parseInt(bk.revenue_this) || 0;
+      var revenuePrev = parseInt(bk.revenue_prev) || 0;
+      var commissionThis = Math.ceil(revenueThis * commissionRate);
+      var commissionPrev = Math.ceil(revenuePrev * commissionRate);
+      var feesThis = Math.ceil(revenueThis * feeRate);
+      var refundsAmount = parseInt(rf.amount) || 0;
+
+      // Variation % vs mois précédent. Si prev=0, +100% si this>0, sinon 0.
+      function delta(a, b) {
+        if (!b) return a > 0 ? 1 : 0;
+        return (a - b) / b;
+      }
+
+      res.json({
+        success: true,
+        finance: {
+          month: {
+            revenue_this: revenueThis,
+            revenue_prev: revenuePrev,
+            revenue_delta_pct: delta(revenueThis, revenuePrev),
+            bookings_this: bk.bookings_this,
+            bookings_prev: bk.bookings_prev,
+            commission_this: commissionThis,
+            commission_prev: commissionPrev,
+            fees_this: feesThis,
+            refunds_count: rf.count,
+            refunds_amount: refundsAmount,
+            net_for_orgas_this: revenueThis - commissionThis - feesThis - refundsAmount,
+          },
+          payouts: {
+            scheduled_count: po.scheduled_count,
+            scheduled_amount: parseInt(po.scheduled_amount) || 0,
+            blocked_count: po.blocked_count,
+            blocked_amount: parseInt(po.blocked_amount) || 0,
+            released_count_this: po.released_count_this,
+            released_amount_this: parseInt(po.released_amount_this) || 0,
+          },
+          rates: {
+            commission: commissionRate,
+            cinetpay_fee: feeRate,
+            tva: tvaRate,
+          },
+          methods: methods.map(function(m) {
+            return {
+              method: m.method,
+              count: m.count,
+              amount: parseInt(m.amount) || 0,
+            };
+          }),
+          daily_revenue: daily.map(function(d) {
+            return {
+              day: d.day,
+              count: d.count,
+              revenue: parseInt(d.revenue) || 0,
+            };
+          }),
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/finance:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-NOTES : Notes internes polymorphiques
 // ============================================================
 // 4 target_types autorisés : user, event, payment, payout. Whitelist côté
