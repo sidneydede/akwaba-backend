@@ -1750,6 +1750,174 @@ router.patch('/users/:id/payout-account', auth.requireAdminRole(['finance']), fu
 });
 
 // ============================================================
+// ADM-ANALYTICS : Cohort retention + funnel conversion
+// ============================================================
+// V1 sans tracking PostHog server-side : on calcule à partir des tables
+// users + bookings uniquement. Cohort = mois d'inscription, retention =
+// % d'users qui ont fait 1+ booking au mois M+N. Funnel = inscrits →
+// 1+ booking créé → 1+ booking confirmé.
+// V2 : intégrer event_view depuis PostHog pour un funnel complet (visite
+// fiche event → start checkout → confirmed).
+
+// GET /admin/analytics/cohort — Matrice cohort retention sur 12 mois.
+router.get('/analytics/cohort', function(req, res) {
+  // Cohort = mois d'inscription. Retention = users qui ont fait un
+  // booking confirmé au mois M+N. On limite à 12 cohortes pour ne pas
+  // ramener une grille géante.
+  pool.query(
+    "WITH user_cohorts AS ( " +
+    "  SELECT id AS user_id, DATE_TRUNC('month', created_at) AS cohort_month " +
+    "  FROM users " +
+    "  WHERE role = 'participant' " +
+    "    AND created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '11 months' " +
+    "), " +
+    "active_months AS ( " +
+    "  SELECT DISTINCT b.user_id, DATE_TRUNC('month', b.created_at) AS booking_month " +
+    "  FROM bookings b WHERE b.statut = 'confirme' " +
+    "), " +
+    "retention AS ( " +
+    "  SELECT " +
+    "    uc.cohort_month, " +
+    "    am.booking_month, " +
+    "    COUNT(DISTINCT uc.user_id) AS active_count " +
+    "  FROM user_cohorts uc " +
+    "  LEFT JOIN active_months am ON am.user_id = uc.user_id " +
+    "    AND am.booking_month >= uc.cohort_month " +
+    "  GROUP BY uc.cohort_month, am.booking_month " +
+    ") " +
+    "SELECT " +
+    "  r.cohort_month, " +
+    "  r.booking_month, " +
+    "  r.active_count, " +
+    "  (SELECT COUNT(*)::int FROM user_cohorts WHERE cohort_month = r.cohort_month) AS cohort_size " +
+    "FROM retention r " +
+    "ORDER BY r.cohort_month ASC, r.booking_month ASC"
+  )
+    .then(function(r) {
+      // Transforme en matrice : map cohortMonth → { size, retention: { '0': %, '1': %, ... } }
+      // M0 = mois d'inscription lui-même, M1 = mois suivant, etc.
+      var matrix = {};
+      r.rows.forEach(function(row) {
+        var cohortKey = row.cohort_month.toISOString().split('T')[0];
+        if (!matrix[cohortKey]) {
+          matrix[cohortKey] = {
+            cohort_month: cohortKey,
+            cohort_size: row.cohort_size,
+            retention: {},
+          };
+        }
+        if (row.booking_month && row.active_count) {
+          var months_diff = Math.round(
+            (new Date(row.booking_month).getTime() - new Date(row.cohort_month).getTime())
+            / (30 * 24 * 3600 * 1000)
+          );
+          if (months_diff >= 0 && months_diff <= 11) {
+            matrix[cohortKey].retention[months_diff] = {
+              active: row.active_count,
+              pct: row.cohort_size > 0
+                ? Math.round((row.active_count / row.cohort_size) * 1000) / 10
+                : 0,
+            };
+          }
+        }
+      });
+
+      var cohorts = Object.keys(matrix)
+        .sort()
+        .reverse() // plus récente en haut
+        .map(function(k) { return matrix[k]; });
+
+      res.json({
+        success: true,
+        cohorts: cohorts,
+        max_months: 12,
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/cohort:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/analytics/funnel — Funnel de conversion users → bookings.
+// 3 étapes : Inscrits, Ont créé 1+ booking (intent), Ont confirmé 1+
+// booking (paying). Calculé sur tous les users 'participant' (lifetime).
+router.get('/analytics/funnel', function(req, res) {
+  Promise.all([
+    // Funnel global (lifetime)
+    pool.query(
+      "SELECT " +
+      "  COUNT(DISTINCT u.id)::int AS total_users, " +
+      "  COUNT(DISTINCT b.user_id) FILTER (WHERE b.id IS NOT NULL)::int AS users_with_booking, " +
+      "  COUNT(DISTINCT b.user_id) FILTER (WHERE b.statut = 'confirme')::int AS users_paid " +
+      "FROM users u LEFT JOIN bookings b ON b.user_id = u.id " +
+      "WHERE u.role = 'participant'"
+    ),
+    // Funnel 30 derniers jours (nouveaux users + leurs bookings dans la fenêtre)
+    pool.query(
+      "WITH new_users AS ( " +
+      "  SELECT id FROM users WHERE role = 'participant' " +
+      "  AND created_at >= NOW() - INTERVAL '30 days' " +
+      ") " +
+      "SELECT " +
+      "  (SELECT COUNT(*)::int FROM new_users) AS total_users, " +
+      "  (SELECT COUNT(DISTINCT b.user_id)::int FROM bookings b " +
+      "    WHERE b.user_id IN (SELECT id FROM new_users)) AS users_with_booking, " +
+      "  (SELECT COUNT(DISTINCT b.user_id)::int FROM bookings b " +
+      "    WHERE b.user_id IN (SELECT id FROM new_users) AND b.statut = 'confirme') AS users_paid"
+    ),
+  ])
+    .then(function(r) {
+      var lifetime = r[0].rows[0];
+      var last30d = r[1].rows[0];
+
+      function pct(part, total) {
+        return total > 0 ? Math.round((part / total) * 1000) / 10 : 0;
+      }
+
+      res.json({
+        success: true,
+        funnels: {
+          lifetime: {
+            steps: [
+              { name: 'Inscrits', count: lifetime.total_users, pct: 100 },
+              {
+                name: 'Ont créé un booking',
+                count: lifetime.users_with_booking,
+                pct: pct(lifetime.users_with_booking, lifetime.total_users),
+              },
+              {
+                name: 'Ont confirmé (payé)',
+                count: lifetime.users_paid,
+                pct: pct(lifetime.users_paid, lifetime.total_users),
+              },
+            ],
+          },
+          last_30_days: {
+            steps: [
+              { name: 'Inscrits', count: last30d.total_users, pct: 100 },
+              {
+                name: 'Ont créé un booking',
+                count: last30d.users_with_booking,
+                pct: pct(last30d.users_with_booking, last30d.total_users),
+              },
+              {
+                name: 'Ont confirmé (payé)',
+                count: last30d.users_paid,
+                pct: pct(last30d.users_paid, last30d.total_users),
+              },
+            ],
+          },
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/funnel:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-SUPPORT : Gestion tickets support côté admin
 // ============================================================
 // Les participants créent leurs tickets via /support/* (cf. routes/support.js).
