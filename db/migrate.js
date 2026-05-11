@@ -477,6 +477,43 @@ CREATE INDEX IF NOT EXISTS idx_admin_notes_author ON admin_notes(author_id, crea
 -- NULL pour les non-admins. Backfill : tous les admins existants → super_admin.\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role VARCHAR(20);\n\
 UPDATE users SET admin_role = 'super_admin' WHERE role = 'admin' AND admin_role IS NULL;\n\
+\n\
+-- ============================================================\n\
+-- ADM-SUPPORT : Tickets support (user → admin thread)\n\
+-- ============================================================\n\
+-- Un user peut créer un ticket avec subject + message initial. L'admin\n\
+-- répond, le user voit la réponse en push + dans l'app. Status workflow :\n\
+--   open      → ouvert, attente réponse admin\n\
+--   waiting   → admin a répondu, attente retour user\n\
+--   resolved  → fermé OK par admin (avec confirmation user implicite)\n\
+--   closed    → fermé sans réponse possible (spam/inactif)\n\
+-- assigned_admin_id : optionnel, pour assigner un ticket à un admin précis.\n\
+-- last_message_at : pour trier la queue par activité récente.\n\
+CREATE TABLE IF NOT EXISTS support_tickets (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  subject VARCHAR(200) NOT NULL,\n\
+  status VARCHAR(20) NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'waiting', 'resolved', 'closed')),\n\
+  assigned_admin_id INTEGER REFERENCES users(id),\n\
+  last_message_at TIMESTAMP DEFAULT NOW(),\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  updated_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_support_tickets_user ON support_tickets(user_id, created_at DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON support_tickets(status, last_message_at DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_support_tickets_assigned ON support_tickets(assigned_admin_id, status);\n\
+\n\
+-- Messages : un thread par ticket. author_role distingue 'user' vs 'admin'\n\
+-- pour l'affichage côté UI (bulle gauche/droite, identité différente).\n\
+CREATE TABLE IF NOT EXISTS support_messages (\n\
+  id SERIAL PRIMARY KEY,\n\
+  ticket_id INTEGER NOT NULL REFERENCES support_tickets(id) ON DELETE CASCADE,\n\
+  author_id INTEGER NOT NULL REFERENCES users(id),\n\
+  author_role VARCHAR(10) NOT NULL CHECK (author_role IN ('user', 'admin')),\n\
+  body TEXT NOT NULL,\n\
+  created_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticket_id, created_at ASC);\n\
 ";
 
 console.log('Migration en cours...');

@@ -33,6 +33,7 @@ var followsRoutes = require('./routes/follows');
 var reviewsRoutes = require('./routes/reviews');
 var waitlistRoutes = require('./routes/waitlist');
 var staffRoutes = require('./routes/staff');
+var supportRoutes = require('./routes/support');
 
 var app = express();
 var PORT = process.env.PORT || 3000;
@@ -118,6 +119,7 @@ app.use('/follows', followsRoutes);
 app.use('/events/:eventId/reviews', reviewsRoutes);
 app.use('/waitlist', waitlistRoutes);
 app.use('/events/:eventId/staff', staffRoutes);
+app.use('/support', supportRoutes);
 
 // Sentry error handler — DOIT être après toutes les routes mais avant
 // les autres middlewares de gestion d'erreur. Capture toute exception non gérée.

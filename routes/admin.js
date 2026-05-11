@@ -1750,6 +1750,302 @@ router.patch('/users/:id/payout-account', auth.requireAdminRole(['finance']), fu
 });
 
 // ============================================================
+// ADM-SUPPORT : Gestion tickets support côté admin
+// ============================================================
+// Les participants créent leurs tickets via /support/* (cf. routes/support.js).
+// Ces routes permettent à l'admin de lister, lire, répondre, assigner, fermer.
+// Toute action admin sur un ticket déclenche notif push au user.
+
+// GET /admin/support/tickets — Liste paginée + filtres
+// @query {string} status - 'open' | 'waiting' | 'resolved' | 'closed' | 'all' (défaut: 'open')
+// @query {string} assigned_admin_id - filtrer par admin assigné OR 'unassigned' OR 'mine'
+// @query {string} search - filtre sur subject OR nom user
+router.get('/support/tickets', function(req, res) {
+  var status = req.query.status || 'open';
+  var assigned = req.query.assigned_admin_id || '';
+  var search = req.query.search || '';
+  var pag = readPagination(req);
+
+  var clauses = [];
+  var params = [];
+
+  if (status && status !== 'all') {
+    params.push(status);
+    clauses.push('t.status = $' + params.length);
+  }
+  if (assigned === 'unassigned') {
+    clauses.push('t.assigned_admin_id IS NULL');
+  } else if (assigned === 'mine') {
+    params.push(req.admin.id);
+    clauses.push('t.assigned_admin_id = $' + params.length);
+  } else if (assigned) {
+    params.push(parseInt(assigned));
+    clauses.push('t.assigned_admin_id = $' + params.length);
+  }
+  if (search) {
+    params.push('%' + search + '%');
+    var idx = params.length;
+    clauses.push('(LOWER(t.subject) LIKE LOWER($' + idx + ') OR LOWER(u.nom) LIKE LOWER($' + idx + ') OR LOWER(u.prenom) LIKE LOWER($' + idx + '))');
+  }
+
+  var where = clauses.length > 0 ? ' WHERE ' + clauses.join(' AND ') : '';
+
+  var listSql =
+    'SELECT t.id, t.user_id, u.nom AS user_nom, u.prenom AS user_prenom, u.phone AS user_phone, ' +
+    't.subject, t.status, t.assigned_admin_id, ' +
+    "a.prenom || ' ' || a.nom AS assigned_admin_name, " +
+    't.last_message_at, t.created_at, ' +
+    'COALESCE((SELECT COUNT(*)::int FROM support_messages WHERE ticket_id = t.id), 0) AS messages_count ' +
+    'FROM support_tickets t ' +
+    'JOIN users u ON u.id = t.user_id ' +
+    'LEFT JOIN users a ON a.id = t.assigned_admin_id' + where +
+    ' ORDER BY t.last_message_at DESC LIMIT ' + pag.pageSize + ' OFFSET ' + pag.offset;
+
+  var countSql =
+    'SELECT COUNT(*)::int AS n FROM support_tickets t ' +
+    'JOIN users u ON u.id = t.user_id' + where;
+
+  // Compteurs par statut pour la sidebar/tabs (sans appliquer status filter).
+  var noStatusClauses = clauses.filter(function(c) { return !c.startsWith('t.status'); });
+  var noStatusParams = params.slice(0, noStatusClauses.length);
+  var statusCountSql =
+    'SELECT status, COUNT(*)::int AS n FROM support_tickets t ' +
+    (clauses.indexOf('t.status') !== -1
+      ? 'WHERE ' + clauses.filter(function(c) { return !c.startsWith('t.status'); }).join(' AND ')
+      : '') +
+    ' GROUP BY status';
+
+  Promise.all([
+    pool.query(listSql, params),
+    pool.query(countSql, params),
+    pool.query('SELECT status, COUNT(*)::int AS n FROM support_tickets GROUP BY status'),
+  ])
+    .then(function(r) {
+      var statusCounts = { open: 0, waiting: 0, resolved: 0, closed: 0 };
+      r[2].rows.forEach(function(row) { statusCounts[row.status] = row.n; });
+
+      res.json({
+        success: true,
+        page: pag.page,
+        page_size: pag.pageSize,
+        total: r[1].rows[0].n,
+        status_counts: statusCounts,
+        tickets: r[0].rows.map(function(t) {
+          return {
+            id: t.id.toString(),
+            user: {
+              id: t.user_id.toString(),
+              nom: t.user_nom,
+              prenom: t.user_prenom,
+              phone: t.user_phone,
+            },
+            subject: t.subject,
+            status: t.status,
+            assigned_admin: t.assigned_admin_id ? {
+              id: t.assigned_admin_id.toString(),
+              name: t.assigned_admin_name,
+            } : null,
+            messages_count: t.messages_count,
+            last_message_at: t.last_message_at,
+            created_at: t.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/support/tickets:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/support/tickets/:id — Thread complet + détails ticket.
+router.get('/support/tickets/:id', function(req, res) {
+  Promise.all([
+    pool.query(
+      'SELECT t.id, t.user_id, u.nom AS user_nom, u.prenom AS user_prenom, ' +
+      'u.phone AS user_phone, u.email AS user_email, ' +
+      't.subject, t.status, t.assigned_admin_id, ' +
+      "a.prenom || ' ' || a.nom AS assigned_admin_name, " +
+      't.last_message_at, t.created_at, t.updated_at ' +
+      'FROM support_tickets t JOIN users u ON u.id = t.user_id ' +
+      'LEFT JOIN users a ON a.id = t.assigned_admin_id ' +
+      'WHERE t.id = $1',
+      [req.params.id]
+    ),
+    pool.query(
+      'SELECT m.id, m.author_id, m.author_role, ' +
+      "u.prenom || ' ' || u.nom AS author_name, " +
+      'm.body, m.created_at ' +
+      'FROM support_messages m LEFT JOIN users u ON u.id = m.author_id ' +
+      'WHERE m.ticket_id = $1 ORDER BY m.created_at ASC',
+      [req.params.id]
+    ),
+  ])
+    .then(function(r) {
+      if (r[0].rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Ticket non trouvé' });
+      }
+      var t = r[0].rows[0];
+      res.json({
+        success: true,
+        ticket: {
+          id: t.id.toString(),
+          user: {
+            id: t.user_id.toString(),
+            nom: t.user_nom,
+            prenom: t.user_prenom,
+            phone: t.user_phone,
+            email: t.user_email,
+          },
+          subject: t.subject,
+          status: t.status,
+          assigned_admin: t.assigned_admin_id ? {
+            id: t.assigned_admin_id.toString(),
+            name: t.assigned_admin_name,
+          } : null,
+          last_message_at: t.last_message_at,
+          created_at: t.created_at,
+          updated_at: t.updated_at,
+        },
+        messages: r[1].rows.map(function(m) {
+          return {
+            id: m.id.toString(),
+            author_id: m.author_id.toString(),
+            author_role: m.author_role,
+            author_name: m.author_name,
+            body: m.body,
+            created_at: m.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/support/tickets/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/support/tickets/:id/messages — Admin répond au ticket.
+// Change auto le status en 'waiting' (attend retour user) + assigne le ticket
+// à l'admin qui répond s'il n'est pas déjà assigné.
+// @body {string} body
+router.post('/support/tickets/:id/messages', function(req, res) {
+  var body = (req.body.body || '').trim();
+  if (!body) {
+    return res.status(400).json({ success: false, message: 'body requis' });
+  }
+  if (body.length > 5000) {
+    return res.status(400).json({ success: false, message: 'body trop long (5000 chars max)' });
+  }
+
+  pool.query(
+    'SELECT id, user_id, status, assigned_admin_id FROM support_tickets WHERE id = $1',
+    [req.params.id]
+  )
+    .then(function(r) {
+      if (r.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Ticket non trouvé' });
+      }
+      var t = r.rows[0];
+
+      return Promise.all([
+        pool.query(
+          "INSERT INTO support_messages (ticket_id, author_id, author_role, body) " +
+          "VALUES ($1, $2, 'admin', $3) RETURNING id, created_at",
+          [req.params.id, req.admin.id, body]
+        ),
+        pool.query(
+          "UPDATE support_tickets SET status = 'waiting', " +
+          "assigned_admin_id = COALESCE(assigned_admin_id, $1), " +
+          "last_message_at = NOW(), updated_at = NOW() WHERE id = $2",
+          [req.admin.id, req.params.id]
+        ),
+      ]).then(function(results) {
+        logAudit(req.admin.id, 'support.reply', 'ticket', req.params.id, null);
+        // Push au user qui a ouvert le ticket
+        push.notifyUser(t.user_id, {
+          title: 'Réponse Akwaba à ton ticket 💬',
+          body: body.length > 80 ? body.slice(0, 80) + '…' : body,
+          data: {
+            type: 'support_admin_reply',
+            ticketId: req.params.id,
+          },
+        });
+
+        res.status(201).json({
+          success: true,
+          message: {
+            id: results[0].rows[0].id.toString(),
+            created_at: results[0].rows[0].created_at,
+          },
+        });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/support/tickets/:id/messages:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/support/tickets/:id — Met à jour status ou assigned_admin_id.
+// @body {string?} status, {number|null?} assigned_admin_id
+router.patch('/support/tickets/:id', function(req, res) {
+  var STATUS_OK = ['open', 'waiting', 'resolved', 'closed'];
+  var fields = [];
+  var params = [];
+
+  if (req.body.status !== undefined) {
+    if (STATUS_OK.indexOf(req.body.status) === -1) {
+      return res.status(400).json({
+        success: false,
+        message: 'status invalide. Disponibles: ' + STATUS_OK.join(', '),
+      });
+    }
+    params.push(req.body.status);
+    fields.push('status = $' + params.length);
+  }
+  if (req.body.assigned_admin_id !== undefined) {
+    var aid = req.body.assigned_admin_id;
+    if (aid === null || aid === '') {
+      params.push(null);
+    } else {
+      params.push(parseInt(aid));
+    }
+    fields.push('assigned_admin_id = $' + params.length);
+  }
+  if (fields.length === 0) {
+    return res.status(400).json({ success: false, message: 'Aucun champ à modifier' });
+  }
+
+  params.push(req.params.id);
+  pool.query(
+    'UPDATE support_tickets SET ' + fields.join(', ') +
+    ', updated_at = NOW() WHERE id = $' + params.length + ' RETURNING id, status, assigned_admin_id',
+    params
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Ticket non trouvé' });
+      }
+      logAudit(req.admin.id, 'support.update', 'ticket', req.params.id, req.body);
+      res.json({
+        success: true,
+        ticket: {
+          id: r.rows[0].id.toString(),
+          status: r.rows[0].status,
+          assigned_admin_id: r.rows[0].assigned_admin_id
+            ? r.rows[0].assigned_admin_id.toString()
+            : null,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/support/tickets/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-FINANCE : Dashboard financier
 // ============================================================
 // Vue agrégée pour le pilotage cash : mois courant vs précédent, à reverser,
