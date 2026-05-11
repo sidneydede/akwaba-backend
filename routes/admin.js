@@ -1697,6 +1697,133 @@ router.patch('/users/:id/payout-account', function(req, res) {
 });
 
 // ============================================================
+// ADM-BULK : Actions en masse (modération events + suspension users)
+// ============================================================
+// Limite hard 100 items par batch pour éviter timeout Render + UPDATE qui
+// touche trop de rows d'un coup. Côté UI on devrait toujours rester sous
+// la limite — pagination 50 par page max.
+
+var BULK_MAX = 100;
+
+// POST /admin/events/bulk-approve — Approuve plusieurs events en attente.
+// Skip ceux qui ne sont pas 'pending' (status != pending → ignoré silencieusement).
+// @body {number[]} event_ids
+router.post('/events/bulk-approve', function(req, res) {
+  var ids = (req.body.event_ids || []).map(function(x) { return parseInt(x); }).filter(Boolean);
+  if (ids.length === 0) {
+    return res.status(400).json({ success: false, message: 'event_ids requis (array non vide)' });
+  }
+  if (ids.length > BULK_MAX) {
+    return res.status(400).json({
+      success: false,
+      message: 'Max ' + BULK_MAX + ' events par batch',
+    });
+  }
+
+  pool.query(
+    "UPDATE events SET status = 'approved', moderated_by = $1, " +
+    "moderated_at = NOW(), rejection_reason = NULL " +
+    "WHERE id = ANY($2::int[]) AND status = 'pending' RETURNING id",
+    [req.admin.id, ids]
+  )
+    .then(function(result) {
+      var approvedIds = result.rows.map(function(r) { return r.id; });
+      logAudit(req.admin.id, 'event.bulk_approve', 'event', null, {
+        requested: ids.length, approved: approvedIds.length, ids: approvedIds,
+      });
+      // Push followers pour chaque event approuvé (fire-and-forget, ignore erreurs)
+      approvedIds.forEach(function(id) {
+        followsRouter.notifyFollowersOfNewEvent(id);
+      });
+      res.json({
+        success: true,
+        approved_count: approvedIds.length,
+        skipped_count: ids.length - approvedIds.length,
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/events/bulk-approve:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/events/bulk-reject — Rejette plusieurs events en attente
+// avec la même raison. Skip ceux pas 'pending'.
+// @body {number[]} event_ids, {string} reason
+router.post('/events/bulk-reject', function(req, res) {
+  var ids = (req.body.event_ids || []).map(function(x) { return parseInt(x); }).filter(Boolean);
+  var reason = (req.body.reason || '').trim();
+  if (ids.length === 0 || !reason) {
+    return res.status(400).json({ success: false, message: 'event_ids et reason requis' });
+  }
+  if (ids.length > BULK_MAX) {
+    return res.status(400).json({ success: false, message: 'Max ' + BULK_MAX + ' events par batch' });
+  }
+
+  pool.query(
+    "UPDATE events SET status = 'rejected', moderated_by = $1, moderated_at = NOW(), " +
+    "rejection_reason = $2 WHERE id = ANY($3::int[]) AND status = 'pending' RETURNING id",
+    [req.admin.id, reason, ids]
+  )
+    .then(function(result) {
+      var rejectedIds = result.rows.map(function(r) { return r.id; });
+      logAudit(req.admin.id, 'event.bulk_reject', 'event', null, {
+        requested: ids.length, rejected: rejectedIds.length, reason: reason, ids: rejectedIds,
+      });
+      res.json({
+        success: true,
+        rejected_count: rejectedIds.length,
+        skipped_count: ids.length - rejectedIds.length,
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/events/bulk-reject:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/users/bulk-suspend — Suspend plusieurs users avec la même raison.
+// Skip ceux déjà suspendus + refuse de suspendre l'admin qui fait la requête.
+// @body {number[]} user_ids, {string} reason
+router.post('/users/bulk-suspend', function(req, res) {
+  var ids = (req.body.user_ids || []).map(function(x) { return parseInt(x); }).filter(Boolean);
+  var reason = (req.body.reason || '').trim();
+  if (ids.length === 0 || !reason) {
+    return res.status(400).json({ success: false, message: 'user_ids et reason requis' });
+  }
+  if (ids.length > BULK_MAX) {
+    return res.status(400).json({ success: false, message: 'Max ' + BULK_MAX + ' users par batch' });
+  }
+  if (ids.indexOf(req.admin.id) !== -1) {
+    return res.status(400).json({
+      success: false,
+      message: 'Impossible de se suspendre soi-même dans un batch',
+    });
+  }
+
+  pool.query(
+    'UPDATE users SET suspended_at = NOW(), suspended_reason = $1 ' +
+    'WHERE id = ANY($2::int[]) AND suspended_at IS NULL RETURNING id',
+    [reason, ids]
+  )
+    .then(function(result) {
+      var suspendedIds = result.rows.map(function(r) { return r.id; });
+      logAudit(req.admin.id, 'user.bulk_suspend', 'user', null, {
+        requested: ids.length, suspended: suspendedIds.length, reason: reason, ids: suspendedIds,
+      });
+      res.json({
+        success: true,
+        suspended_count: suspendedIds.length,
+        skipped_count: ids.length - suspendedIds.length,
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/users/bulk-suspend:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-HEALTH : Score santé organisateur
 // ============================================================
 // Score composite 0-100 sur 4 axes pondérés :
