@@ -2866,6 +2866,51 @@ router.get('/kyc', function(req, res) {
     });
 });
 
+// GET /admin/kyc/:userId/doc/:key — Proxy auth-gated vers un document KYC.
+// SEC NEW-3 V1 : passe par le backend pour 2 raisons :
+//   1. Audit log (qui a vu quoi, quand) — traçabilité RGPD obligation.
+//   2. Single point de révocation si compte admin compromis (kill switch
+//      en désactivant la route).
+// V2 (futur) : quand l'upload UI existera côté mobile/orga, on stockera
+// public_id (pas URL complète) dans kyc_documents JSONB, et on générera
+// une signed URL Cloudinary "authenticated" avec TTL 5 min ici.
+router.get('/kyc/:userId/doc/:key', auth.requireAdminRole(['moderator']), function(req, res) {
+  if (!/^[a-zA-Z0-9_-]+$/.test(req.params.key)) {
+    return res.status(400).send('Key invalide');
+  }
+  pool.query('SELECT kyc_documents FROM users WHERE id = $1', [req.params.userId])
+    .then(function(r) {
+      if (r.rows.length === 0 || !r.rows[0].kyc_documents) {
+        return res.status(404).send('Document non trouvé');
+      }
+      var docs = r.rows[0].kyc_documents;
+      var docRef = docs[req.params.key];
+      if (!docRef) {
+        return res.status(404).send('Document non trouvé');
+      }
+
+      // Audit log : trace l'accès au document PII identité.
+      logAudit(req.admin.id, 'kyc.doc_view', 'user', req.params.userId, {
+        key: req.params.key,
+      });
+
+      // V1 : URL doit être Cloudinary du tenant. V2 : générer signed URL.
+      if (typeof docRef !== 'string' || docRef.length > 500) {
+        return res.status(500).send('Document invalide');
+      }
+      var cloudName = process.env.CLOUDINARY_CLOUD_NAME || '';
+      var allowedPrefix = cloudName ? 'https://res.cloudinary.com/' + cloudName + '/' : null;
+      if (!allowedPrefix || docRef.indexOf(allowedPrefix) !== 0) {
+        return res.status(500).send('URL document invalide');
+      }
+      res.redirect(302, docRef);
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/kyc/:userId/doc/:key:', err.message);
+      res.status(500).send('Erreur serveur');
+    });
+});
+
 // PATCH /admin/kyc/:userId — Approve / reject KYC d'un orga.
 // @body {string} kyc_status - 'approved' | 'rejected' | 'pending' | 'none'
 // @body {string?} kyc_rejection_reason (requis si 'rejected')

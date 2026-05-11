@@ -642,6 +642,15 @@ CREATE TABLE IF NOT EXISTS user_audit_log (\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_user_audit_user ON user_audit_log(user_id, created_at DESC);\n\
 CREATE INDEX IF NOT EXISTS idx_user_audit_action ON user_audit_log(action, created_at DESC);\n\
+\n\
+-- ============================================================\n\
+-- SEC-M9 : Token revocation via password_changed_at\n\
+-- ============================================================\n\
+-- Tokens dont issuedAt < password_changed_at sont rejetés au middleware.\n\
+-- Quand admin compromis change son password (ou est forcé par super_admin),\n\
+-- tous ses tokens en circulation deviennent invalides immédiatement.\n\
+-- NULL = pas encore set (pas de révocation forcée).\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;\n\
 ";
 
 console.log('Migration en cours...');

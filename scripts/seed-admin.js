@@ -6,6 +6,7 @@
 require('dotenv').config();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
+var passwordPolicy = require('../services/passwordPolicy');
 
 var args = process.argv.slice(2);
 var email = (args[0] || '').trim().toLowerCase();
@@ -18,8 +19,10 @@ if (!email || !password) {
   process.exit(1);
 }
 
-if (password.length < 8) {
-  console.error('Le mot de passe doit faire au moins 8 caractères');
+// SEC M2 : password complexity (12+ chars, maj/min/chiffre/spécial, pas commun).
+var policyError = passwordPolicy.validate(password, { email: email, nom: nom });
+if (policyError) {
+  console.error('Password invalide : ' + policyError);
   process.exit(1);
 }
 
@@ -32,11 +35,14 @@ console.log('Création/mise à jour admin pour ' + email + '...');
 
 auth.hashPassword(password)
   .then(function(passwordHash) {
+    // SEC M9 : password_changed_at = NOW() pour invalider les anciens tokens
+    // de cet admin (s'il en avait des actifs avant le reset).
     return pool.query(
-      'INSERT INTO users (nom, prenom, phone, email, role, password_hash) ' +
-      'VALUES ($1, $2, $3, $4, $5, $6) ' +
+      'INSERT INTO users (nom, prenom, phone, email, role, password_hash, password_changed_at) ' +
+      'VALUES ($1, $2, $3, $4, $5, $6, NOW()) ' +
       'ON CONFLICT (phone) DO UPDATE SET ' +
       'email = EXCLUDED.email, role = EXCLUDED.role, password_hash = EXCLUDED.password_hash, ' +
+      'password_changed_at = NOW(), ' +
       'nom = EXCLUDED.nom, prenom = EXCLUDED.prenom, updated_at = NOW() ' +
       'RETURNING id, email, role',
       [nom, prenom, fakePhone, email, 'admin', passwordHash]

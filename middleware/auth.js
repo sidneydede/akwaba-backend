@@ -45,6 +45,21 @@ function generateToken(userId) {
   return token;
 }
 
+// SEC M9 : extrait le timestamp d'émission d'un token SANS le verify.
+// Utilisé par requireAdmin pour comparer avec password_changed_at et
+// invalider les tokens émis avant un changement de password.
+// @returns {number|null} ms epoch d'émission, ou null si format invalide.
+function tokenIssuedAt(token) {
+  try {
+    var decoded = Buffer.from(token, 'base64').toString('utf8');
+    var parts = decoded.split(':');
+    if (parts.length !== 3 || !/^\d+$/.test(parts[1])) return null;
+    return parseInt(parts[1]);
+  } catch (e) {
+    return null;
+  }
+}
+
 // Décode un token et retourne le userId.
 // @param {string} token - Token à décoder
 // @param {number} [maxAgeMs] - Si fourni, rejette les tokens plus vieux que cette durée.
@@ -155,7 +170,8 @@ function requireOrganizer(req, res, next) {
 // role, admin_role }.
 function requireAdmin(req, res, next) {
   pool.query(
-    'SELECT id, nom, prenom, phone, email, role, admin_role, suspended_at FROM users WHERE id = $1',
+    'SELECT id, nom, prenom, phone, email, role, admin_role, suspended_at, password_changed_at ' +
+    'FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -168,6 +184,22 @@ function requireAdmin(req, res, next) {
       }
       if (user.suspended_at) {
         return res.status(403).json({ success: false, message: 'Compte suspendu' });
+      }
+      // SEC M9 : revoke tous les tokens émis avant le dernier changement de
+      // password (admin compromis, reset forcé par super_admin, etc.).
+      if (user.password_changed_at) {
+        var authHeader = req.headers.authorization || '';
+        var token = authHeader.replace('Bearer ', '');
+        var issuedAt = tokenIssuedAt(token);
+        var pwChangedAt = new Date(user.password_changed_at).getTime();
+        // Tolérance 5s pour les race conditions au moment du changement de password.
+        if (issuedAt !== null && issuedAt < pwChangedAt - 5000) {
+          return res.status(401).json({
+            success: false,
+            code: 'token_revoked',
+            message: 'Token révoqué (changement de mot de passe). Reconnecte-toi.',
+          });
+        }
       }
       req.admin = user;
       next();
@@ -273,6 +305,7 @@ function verifyPassword(password, stored) {
 module.exports = {
   generateToken: generateToken,
   decodeToken: decodeToken,
+  tokenIssuedAt: tokenIssuedAt,
   generateChallengeToken: generateChallengeToken,
   decodeChallengeToken: decodeChallengeToken,
   authMiddleware: authMiddleware,
