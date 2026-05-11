@@ -24,6 +24,7 @@ var bookingsRoutes = require('./routes/bookings');
 var paymentsRoutes = require('./routes/payments');
 var devicesRoutes = require('./routes/devices');
 var adminRoutes = require('./routes/admin');
+var adminExportsRoutes = require('./routes/admin-exports');
 var bannersRoutes = require('./routes/banners');
 var favoritesRoutes = require('./routes/favorites');
 var feedbackRoutes = require('./routes/feedback');
@@ -103,6 +104,9 @@ app.use('/events', eventsRoutes);
 app.use('/bookings', bookingsRoutes);
 app.use('/payments', paymentsRoutes);
 app.use('/devices', devicesRoutes);
+// /admin/exports DOIT être monté AVANT /admin sinon le router admin grab le path
+// et renvoie 404 (il ne définit pas /exports en interne).
+app.use('/admin/exports', adminExportsRoutes);
 app.use('/admin', adminRoutes);
 app.use('/banners', bannersRoutes);
 app.use('/favorites', favoritesRoutes);
