@@ -4,7 +4,26 @@
 var crypto = require('crypto');
 var pool = require('../db/pool');
 
-var TOKEN_SECRET = process.env.TOKEN_SECRET || 'akwaba-secret-dev';
+// TOKEN_SECRET doit être défini en prod, sinon tous les tokens seraient forgeables.
+// Fail-fast au boot plutôt que silently fallback sur un secret connu.
+var TOKEN_SECRET = process.env.TOKEN_SECRET;
+if (!TOKEN_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'TOKEN_SECRET manquant en production. Définis la variable d\'environnement avant de démarrer.'
+    );
+  }
+  TOKEN_SECRET = 'akwaba-secret-dev';
+  console.warn('[auth] TOKEN_SECRET absent — fallback dev utilisé. NE JAMAIS déployer comme ça.');
+}
+
+// Durée de vie courte pour les tokens admin (back-office sensible).
+var ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000; // 8h
+
+// Durée du "challenge token" remis après la validation du password mais avant
+// la saisie du code TOTP. Court pour limiter une fenêtre d'attaque où ce token
+// serait volé. 5 min suffit largement pour ouvrir son app authenticator.
+var CHALLENGE_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 min
 
 // Génère un token pour un utilisateur
 // @param {number} userId - ID de l'utilisateur
@@ -18,10 +37,13 @@ function generateToken(userId) {
   return token;
 }
 
-// Décode un token et retourne le userId
+// Décode un token et retourne le userId.
 // @param {string} token - Token à décoder
-// @returns {number|null} userId ou null si invalide
-function decodeToken(token) {
+// @param {number} [maxAgeMs] - Si fourni, rejette les tokens plus vieux que cette durée.
+//   Le flux mobile (auth OTP) appelle sans maxAge → token longue durée.
+//   Le flux admin (back-office) appelle avec ADMIN_TOKEN_TTL_MS → expire après 8h.
+// @returns {number|null} userId ou null si invalide/expiré
+function decodeToken(token, maxAgeMs) {
   try {
     var decoded = Buffer.from(token, 'base64').toString('utf8');
     var parts = decoded.split(':');
@@ -29,11 +51,21 @@ function decodeToken(token) {
     var userId = parseInt(parts[0]);
     var timestamp = parts[1];
     var hash = parts[2];
-    // Vérifie le hash
+    if (!userId || !/^\d+$/.test(timestamp)) return null;
+    // Vérifie le hash (HMAC sur userId:timestamp).
     var expectedHash = crypto.createHmac('sha256', TOKEN_SECRET)
       .update(userId + ':' + timestamp)
       .digest('hex');
-    if (hash !== expectedHash) return null;
+    // Comparaison timing-safe — le hash est de longueur fixe (64 hex).
+    if (hash.length !== expectedHash.length) return null;
+    var hashBuf = Buffer.from(hash, 'hex');
+    var expBuf = Buffer.from(expectedHash, 'hex');
+    if (hashBuf.length !== expBuf.length || !crypto.timingSafeEqual(hashBuf, expBuf)) return null;
+    // Vérifie l'expiration si demandé. maxAgeMs=undefined → pas de check.
+    if (typeof maxAgeMs === 'number' && maxAgeMs >= 0) {
+      var age = Date.now() - parseInt(timestamp);
+      if (age > maxAgeMs) return null;
+    }
     return userId;
   } catch (e) {
     return null;
@@ -51,6 +83,27 @@ function authMiddleware(req, res, next) {
   var userId = decodeToken(token);
   if (!userId) {
     return res.status(401).json({ success: false, message: 'Token invalide' });
+  }
+  req.userId = userId;
+  next();
+}
+
+// Variante stricte pour les routes admin : applique ADMIN_TOKEN_TTL_MS.
+// Réponse 401 avec code 'token_expired' distinct pour permettre au front
+// d'afficher un message clair ("Session expirée, reconnectez-vous").
+function adminAuthMiddleware(req, res, next) {
+  var authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Token manquant' });
+  }
+  var token = authHeader.replace('Bearer ', '');
+  var userId = decodeToken(token, ADMIN_TOKEN_TTL_MS);
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      code: 'token_expired',
+      message: 'Session expirée ou invalide'
+    });
   }
   req.userId = userId;
   next();
@@ -104,6 +157,47 @@ function requireAdmin(req, res, next) {
     });
 }
 
+// Génère un token "purpose-scoped" — utilisé pour le challenge 2FA entre
+// l'étape password et l'étape TOTP. Format distinct (4 parts vs 3) pour qu'un
+// challenge token ne puisse PAS être accepté par decodeToken/authMiddleware
+// comme un token de session normal.
+// @param {number} userId
+// @param {string} purpose - ex. 'totp_challenge'
+// @returns {string}
+function generateChallengeToken(userId, purpose) {
+  var ts = Date.now().toString();
+  var data = userId + ':' + ts + ':' + purpose;
+  var hash = crypto.createHmac('sha256', TOKEN_SECRET).update(data).digest('hex');
+  return Buffer.from(data + ':' + hash).toString('base64');
+}
+
+// Vérifie un challenge token + son purpose + son âge. Retourne userId ou null.
+function decodeChallengeToken(token, expectedPurpose, maxAgeMs) {
+  try {
+    var decoded = Buffer.from(token, 'base64').toString('utf8');
+    var parts = decoded.split(':');
+    if (parts.length !== 4) return null;
+    var userId = parseInt(parts[0]);
+    var ts = parts[1];
+    var purpose = parts[2];
+    var hash = parts[3];
+    if (!userId || !/^\d+$/.test(ts)) return null;
+    if (purpose !== expectedPurpose) return null;
+    var expected = crypto.createHmac('sha256', TOKEN_SECRET)
+      .update(userId + ':' + ts + ':' + purpose).digest('hex');
+    if (hash.length !== expected.length) return null;
+    var a = Buffer.from(hash, 'hex');
+    var b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    if (typeof maxAgeMs === 'number' && maxAgeMs >= 0) {
+      if (Date.now() - parseInt(ts) > maxAgeMs) return null;
+    }
+    return userId;
+  } catch (e) {
+    return null;
+  }
+}
+
 // Hash un mot de passe avec scrypt + salt aléatoire (64 octets dérivés).
 // Format de stockage : "scrypt:<salt-hex>:<derived-hex>"
 // scrypt est intégré à Node, pas besoin de dépendance bcrypt.
@@ -135,9 +229,14 @@ function verifyPassword(password, stored) {
 module.exports = {
   generateToken: generateToken,
   decodeToken: decodeToken,
+  generateChallengeToken: generateChallengeToken,
+  decodeChallengeToken: decodeChallengeToken,
   authMiddleware: authMiddleware,
+  adminAuthMiddleware: adminAuthMiddleware,
   requireOrganizer: requireOrganizer,
   requireAdmin: requireAdmin,
   hashPassword: hashPassword,
-  verifyPassword: verifyPassword
+  verifyPassword: verifyPassword,
+  ADMIN_TOKEN_TTL_MS: ADMIN_TOKEN_TTL_MS,
+  CHALLENGE_TOKEN_TTL_MS: CHALLENGE_TOKEN_TTL_MS
 };

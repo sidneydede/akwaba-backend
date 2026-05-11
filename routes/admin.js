@@ -3,12 +3,26 @@
 // Auth : email + password (scrypt) — distinct du flux OTP/SMS du mobile.
 
 var express = require('express');
+var rateLimit = require('express-rate-limit');
 var router = express.Router();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var push = require('../services/push');
 var cinetpay = require('../services/cinetpay');
 var followsRouter = require('./follows');
+
+// Rate limit sur le login admin : 5 tentatives / 15 min par IP.
+// Compte uniquement les échecs (skipSuccessfulRequests) — un admin qui se
+// reconnecte plein de fois ne se fera pas bloquer. En back-office on accepte
+// un faux positif occasionnel : mieux qu'autoriser un brute force.
+var adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { success: false, message: 'Trop de tentatives. Réessayez dans 15 minutes.' }
+});
 
 // Pagination par défaut. Limite haute volontairement modeste pour
 // éviter qu'un admin ne charge accidentellement 10k lignes.
@@ -44,9 +58,13 @@ function readPagination(req) {
 
 // Auth -------------------------------------------------------------------
 
-// POST /admin/auth/login — Login admin par email + password
+// POST /admin/auth/login — Étape 1 : email + password.
+// Si l'admin a déjà activé son 2FA → retourne un challenge_token court (5 min)
+// que le front doit ré-envoyer à /admin/auth/login/verify avec le code TOTP.
+// Sinon (admin pas encore 2FA-isé) → retourne le token complet + must_setup_2fa=true
+// pour que le front pousse direct sur l'écran de setup.
 // @body {string} email, password
-router.post('/auth/login', function(req, res) {
+router.post('/auth/login', adminLoginLimiter, function(req, res) {
   var email = (req.body.email || '').trim().toLowerCase();
   var password = req.body.password || '';
 
@@ -55,7 +73,8 @@ router.post('/auth/login', function(req, res) {
   }
 
   pool.query(
-    "SELECT id, nom, prenom, email, role, password_hash, suspended_at FROM users WHERE LOWER(email) = $1 AND role = 'admin'",
+    "SELECT id, nom, prenom, email, role, password_hash, suspended_at, totp_enabled_at " +
+    "FROM users WHERE LOWER(email) = $1 AND role = 'admin'",
     [email]
   )
     .then(function(result) {
@@ -75,13 +94,29 @@ router.post('/auth/login', function(req, res) {
         if (!ok) {
           return res.status(401).json({ success: false, message: 'Identifiants invalides' });
         }
+
+        // Si 2FA déjà activé → étape password validée mais on ne livre PAS le token de session.
+        // On délivre un challenge_token signé qui ne sert qu'à /admin/auth/login/verify.
+        if (user.totp_enabled_at) {
+          var challengeToken = auth.generateChallengeToken(user.id, 'totp_challenge');
+          return res.json({
+            success: true,
+            requires_totp: true,
+            challenge_token: challengeToken,
+            expires_in_sec: Math.floor(auth.CHALLENGE_TOKEN_TTL_MS / 1000)
+          });
+        }
+
+        // Premier login (admin existant pré-2FA, ou nouveau seed) : token complet
+        // + flag must_setup_2fa pour que le front force l'écran de configuration.
         pool.query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id])
           .catch(function(err) { console.error('Erreur update last_login:', err.message); });
         var token = auth.generateToken(user.id);
-        logAudit(user.id, 'admin.login', 'user', user.id, null);
+        logAudit(user.id, 'admin.login', 'user', user.id, { must_setup_2fa: true });
         res.json({
           success: true,
           token: token,
+          must_setup_2fa: true,
           admin: {
             id: user.id.toString(),
             nom: user.nom,
@@ -98,22 +133,201 @@ router.post('/auth/login', function(req, res) {
     });
 });
 
+// POST /admin/auth/login/verify — Étape 2 : code TOTP.
+// Reçoit le challenge_token issu de l'étape 1 + le code à 6 chiffres.
+// Si OK → retourne le token de session 8h.
+// @body {string} challenge_token, code
+router.post('/auth/login/verify', adminLoginLimiter, function(req, res) {
+  var challengeToken = req.body.challenge_token || '';
+  var code = (req.body.code || '').trim();
+  if (!challengeToken || !code) {
+    return res.status(400).json({ success: false, message: 'challenge_token et code requis' });
+  }
+  if (!/^\d{6}$/.test(code)) {
+    return res.status(400).json({ success: false, message: 'Code TOTP invalide (6 chiffres)' });
+  }
+
+  var userId = auth.decodeChallengeToken(challengeToken, 'totp_challenge', auth.CHALLENGE_TOKEN_TTL_MS);
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      code: 'challenge_expired',
+      message: 'Challenge expiré ou invalide, recommencez le login'
+    });
+  }
+
+  pool.query(
+    "SELECT id, nom, prenom, email, role, totp_secret, totp_enabled_at, suspended_at " +
+    "FROM users WHERE id = $1 AND role = 'admin'",
+    [userId]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) {
+        return res.status(401).json({ success: false, message: 'Utilisateur introuvable' });
+      }
+      var user = result.rows[0];
+      if (user.suspended_at) {
+        return res.status(403).json({ success: false, message: 'Compte suspendu' });
+      }
+      if (!user.totp_enabled_at || !user.totp_secret) {
+        return res.status(400).json({ success: false, message: '2FA non configuré pour ce compte' });
+      }
+
+      var speakeasy = require('speakeasy');
+      var verified = speakeasy.totp.verify({
+        secret: user.totp_secret,
+        encoding: 'base32',
+        token: code,
+        window: 1 // tolérance ±30s pour absorber un léger décalage d'horloge
+      });
+
+      if (!verified) {
+        logAudit(user.id, 'admin.login.totp_fail', 'user', user.id, null);
+        return res.status(401).json({ success: false, message: 'Code incorrect' });
+      }
+
+      pool.query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id])
+        .catch(function(err) { console.error('Erreur update last_login:', err.message); });
+      var token = auth.generateToken(user.id);
+      logAudit(user.id, 'admin.login', 'user', user.id, null);
+      res.json({
+        success: true,
+        token: token,
+        admin: {
+          id: user.id.toString(),
+          nom: user.nom,
+          prenom: user.prenom,
+          email: user.email,
+          role: user.role
+        }
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur admin/auth/login/verify:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // Toutes les routes ci-dessous exigent un admin authentifié.
-router.use(auth.authMiddleware, auth.requireAdmin);
+// adminAuthMiddleware (vs authMiddleware) applique en plus une expiration de 8h
+// sur le token (back-office sensible). Mobile reste sans TTL.
+router.use(auth.adminAuthMiddleware, auth.requireAdmin);
 
 // GET /admin/me — Profil admin courant
 router.get('/me', function(req, res) {
-  res.json({
-    success: true,
-    admin: {
-      id: req.admin.id.toString(),
-      nom: req.admin.nom,
-      prenom: req.admin.prenom,
-      email: req.admin.email,
-      phone: req.admin.phone,
-      role: req.admin.role
-    }
+  pool.query('SELECT totp_enabled_at FROM users WHERE id = $1', [req.admin.id])
+    .then(function(r) {
+      var totpEnabled = r.rows.length > 0 && r.rows[0].totp_enabled_at;
+      res.json({
+        success: true,
+        admin: {
+          id: req.admin.id.toString(),
+          nom: req.admin.nom,
+          prenom: req.admin.prenom,
+          email: req.admin.email,
+          phone: req.admin.phone,
+          role: req.admin.role,
+          totp_enabled: !!totpEnabled,
+          must_setup_2fa: !totpEnabled
+        }
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/me:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// 2FA setup ---------------------------------------------------------------
+
+// POST /admin/2fa/setup — Génère un nouveau secret TOTP en attente d'activation.
+// Le secret est stocké dans totp_pending_secret (pas encore actif). L'admin
+// doit scanner le QR avec son authenticator puis appeler /admin/2fa/activate
+// avec un code valide pour confirmer (sinon le secret reste en pending et
+// peut être régénéré).
+// @returns {object} { secret, otpauth_url, qr_data_url }
+router.post('/2fa/setup', function(req, res) {
+  var speakeasy = require('speakeasy');
+  var QRCode = require('qrcode');
+
+  // 20 octets = 160 bits d'entropie en base32, standard RFC 6238.
+  // On reconstruit l'otpauth URL avec issuer en query pour que les apps
+  // (Google Authenticator, Authy, 1Password) groupent les comptes proprement.
+  var secretObj = speakeasy.generateSecret({ length: 20 });
+  var otpauthUrl = speakeasy.otpauthURL({
+    secret: secretObj.base32,
+    label: req.admin.email,
+    issuer: 'Akwaba Admin',
+    encoding: 'base32'
   });
+
+  pool.query(
+    'UPDATE users SET totp_pending_secret = $1, updated_at = NOW() WHERE id = $2',
+    [secretObj.base32, req.admin.id]
+  )
+    .then(function() {
+      // QR PNG en data URL — affichable direct dans une <img src=...>.
+      return QRCode.toDataURL(otpauthUrl);
+    })
+    .then(function(qrDataUrl) {
+      logAudit(req.admin.id, 'admin.2fa.setup', 'user', req.admin.id, null);
+      res.json({
+        success: true,
+        secret: secretObj.base32,
+        otpauth_url: otpauthUrl,
+        qr_data_url: qrDataUrl
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/2fa/setup:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/2fa/activate — Confirme le secret pending avec un premier code valide.
+// Une fois activé, le prochain login devra fournir un code TOTP.
+// @body {string} code - 6 chiffres
+router.post('/2fa/activate', function(req, res) {
+  var code = (req.body.code || '').trim();
+  if (!/^\d{6}$/.test(code)) {
+    return res.status(400).json({ success: false, message: 'Code TOTP invalide (6 chiffres)' });
+  }
+
+  pool.query('SELECT totp_pending_secret FROM users WHERE id = $1', [req.admin.id])
+    .then(function(r) {
+      if (r.rows.length === 0 || !r.rows[0].totp_pending_secret) {
+        return res.status(400).json({
+          success: false,
+          message: 'Aucun setup en attente. Appelle /admin/2fa/setup d\'abord.'
+        });
+      }
+      var pending = r.rows[0].totp_pending_secret;
+
+      var speakeasy = require('speakeasy');
+      var verified = speakeasy.totp.verify({
+        secret: pending,
+        encoding: 'base32',
+        token: code,
+        window: 1
+      });
+
+      if (!verified) {
+        return res.status(401).json({ success: false, message: 'Code incorrect' });
+      }
+
+      return pool.query(
+        'UPDATE users SET totp_secret = $1, totp_pending_secret = NULL, ' +
+        'totp_enabled_at = NOW(), updated_at = NOW() WHERE id = $2',
+        [pending, req.admin.id]
+      ).then(function() {
+        logAudit(req.admin.id, 'admin.2fa.activate', 'user', req.admin.id, null);
+        res.json({ success: true, message: '2FA activé' });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/2fa/activate:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
 });
 
 // Stats ------------------------------------------------------------------

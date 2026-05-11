@@ -415,6 +415,18 @@ CREATE TABLE IF NOT EXISTS event_staff (\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_event_staff_user ON event_staff(user_id);\n\
 CREATE INDEX IF NOT EXISTS idx_event_staff_event ON event_staff(event_id);\n\
+\n\
+-- ============================================================\n\
+-- ADM-2FA : TOTP obligatoire pour les comptes admin\n\
+-- ============================================================\n\
+-- totp_secret = secret confirme et actif (utilise au login)\n\
+-- totp_pending_secret = secret en cours de setup (avant la 1ere validation par code)\n\
+-- totp_enabled_at = date d'activation (NULL = pas encore active)\n\
+-- Les admins existants devront passer par /admin/2fa/setup au prochain login\n\
+-- (must_setup_2fa = true tant que totp_enabled_at IS NULL).\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_pending_secret VARCHAR(64);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_enabled_at TIMESTAMP;\n\
 ";
 
 console.log('Migration en cours...');

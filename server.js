@@ -36,6 +36,11 @@ var staffRoutes = require('./routes/staff');
 var app = express();
 var PORT = process.env.PORT || 3000;
 
+// Render / Cloudflare ajoutent un proxy devant l'app. Sans ce flag, req.ip
+// vaut toujours l'IP du proxy → le rate-limit lumpe tous les users ensemble.
+// '1' = on fait confiance à un seul hop de proxy (suffisant pour Render).
+app.set('trust proxy', 1);
+
 // Middlewares
 // CORS : autorise l'app mobile (origin null sur Expo Go natif) + le site commercial
 // + la webapp orga. En dev on accepte aussi les ports Vite (5173/5174) et Expo web.
