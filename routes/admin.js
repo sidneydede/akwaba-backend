@@ -2804,11 +2804,13 @@ router.get('/kyc', function(req, res) {
   var status = req.query.status || 'pending';
   var pag = readPagination(req);
 
-  var clauses = ["role = 'organisateur'"];
+  // FIX SQL ambiguity : 'role' était unqualified, conflit avec LEFT JOIN
+  // users r (qui a aussi une colonne role). On préfixe sur u.
+  var clauses = ["u.role = 'organisateur'"];
   var params = [];
   if (status !== 'all') {
     params.push(status);
-    clauses.push('kyc_status = $' + params.length);
+    clauses.push('u.kyc_status = $' + params.length);
   }
   var where = ' WHERE ' + clauses.join(' AND ');
 
@@ -2823,7 +2825,8 @@ router.get('/kyc', function(req, res) {
     ' ORDER BY u.kyc_submitted_at DESC NULLS LAST, u.created_at DESC LIMIT ' +
     pag.pageSize + ' OFFSET ' + pag.offset;
 
-  var countSql = 'SELECT COUNT(*)::int AS n FROM users' + where;
+  // countSql utilise aussi 'u' pour cohérence avec les clauses préfixées.
+  var countSql = 'SELECT COUNT(*)::int AS n FROM users u LEFT JOIN users r ON r.id = u.kyc_reviewed_by' + where;
 
   var statusCountsSql =
     "SELECT COALESCE(kyc_status, 'none') AS status, COUNT(*)::int AS n " +
