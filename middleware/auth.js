@@ -112,7 +112,7 @@ function adminAuthMiddleware(req, res, next) {
 // Vérifie que l'utilisateur authentifié est un organisateur
 // À chaîner après authMiddleware. Pose req.user = { id, nom, prenom, phone, role }.
 function requireOrganizer(req, res, next) {
-  pool.query('SELECT id, nom, prenom, phone, role FROM users WHERE id = $1', [req.userId])
+  pool.query('SELECT id, nom, prenom, phone, role, kyc_status FROM users WHERE id = $1', [req.userId])
     .then(function(result) {
       if (result.rows.length === 0) {
         return res.status(401).json({ success: false, message: 'Utilisateur introuvable' });

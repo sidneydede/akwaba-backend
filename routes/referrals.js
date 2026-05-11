@@ -57,7 +57,9 @@ router.post('/redeem', auth.authMiddleware, function(req, res) {
           var ref = insertResult.rows[0];
           // Award immediat des points au filleul (500 par defaut)
           return pool.query(
-            'UPDATE users SET points = COALESCE(points, 0) + $1 WHERE id = $2 RETURNING points',
+            "UPDATE users SET points = COALESCE(points, 0) + $1, " +
+            "acquisition_source = COALESCE(acquisition_source, 'referral') " +
+            "WHERE id = $2 RETURNING points",
             [ref.points_filleul, req.userId]
           ).then(function(pointsResult) {
             return pool.query('COMMIT').then(function() {

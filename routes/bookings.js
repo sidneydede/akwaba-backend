@@ -633,11 +633,15 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
         var refundAmount = Math.floor(b.total_amount * ratio);
 
         // Transaction : update booking + relâche les places.
+        // refund_status passe en 'pending' si remboursement dû, 'skip' sinon.
+        // L'admin verra le booking dans /refunds queue et marquera 'paid'
+        // après virement manuel CinetPay.
+        var initialRefundStatus = refundAmount > 0 ? 'pending' : 'skip';
         return pool.query(
           "UPDATE bookings SET statut = 'annule', cancelled_at = NOW(), " +
           'refund_amount = $1, refund_ratio = $2, cancellation_reason = $3, ' +
-          'updated_at = NOW() WHERE id = $4 RETURNING id',
-          [refundAmount, ratio, reason || null, bookingId]
+          'refund_status = $5, updated_at = NOW() WHERE id = $4 RETURNING id',
+          [refundAmount, ratio, reason || null, bookingId, initialRefundStatus]
         )
           .then(function() {
             return pool.query(

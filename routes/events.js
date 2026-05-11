@@ -482,6 +482,22 @@ router.post('/upload-signature', auth.authMiddleware, auth.requireOrganizer, fun
 router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
   var body = req.body;
 
+  // ADM-KYC : bloque la création si l'orga n'a pas son KYC validé. Les orgas
+  // grandfathered (existants avant la migration) sont déjà 'approved'.
+  // Les nouveaux organisateurs partent de 'none' et doivent soumettre.
+  if (req.user.kyc_status && req.user.kyc_status !== 'approved') {
+    return res.status(403).json({
+      success: false,
+      code: 'kyc_required',
+      kyc_status: req.user.kyc_status,
+      message: req.user.kyc_status === 'pending'
+        ? 'Vérification KYC en cours de review. Création d\'event bloquée le temps de la validation.'
+        : req.user.kyc_status === 'rejected'
+          ? 'Vérification KYC rejetée. Re-soumets tes documents.'
+          : 'Vérification KYC requise avant de créer un event. Contacte le support.',
+    });
+  }
+
   if (!body.title || !body.category || !body.date || !body.lieu) {
     return res.status(400).json({
       success: false,
@@ -726,6 +742,44 @@ router.delete('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, 
     .catch(function(err) {
       console.error('Erreur DELETE /events/:id:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// ADM-SEARCH-LOG : Log des recherches users (signal acquisition)
+// ============================================================
+// POST /events/search-log — Le mobile log chaque search (typiquement quand
+// result_count est connu après l'appel /events?search=). On garde tout, le
+// front filtrera par result_count=0 côté admin pour identifier les requêtes
+// non satisfaites.
+// @body {string} query, {number} result_count
+router.post('/search-log', function(req, res) {
+  var query = (req.body.query || '').trim();
+  var resultCount = parseInt(req.body.result_count);
+  if (!query || query.length > 200 || isNaN(resultCount)) {
+    return res.status(400).json({ success: false, message: 'query + result_count requis' });
+  }
+
+  // user_id optionnel — si Authorization header présent, on attache l'user.
+  // Sinon log anonyme (user_id NULL).
+  var userId = null;
+  var authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    var auth = require('../middleware/auth');
+    userId = auth.decodeToken(authHeader.replace('Bearer ', ''));
+  }
+
+  pool.query(
+    'INSERT INTO search_queries (query, user_id, result_count) VALUES ($1, $2, $3)',
+    [query.slice(0, 200), userId, resultCount]
+  )
+    .then(function() {
+      res.json({ success: true });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /events/search-log:', err.message);
+      // Silent fail — un log raté ne doit pas casser le front.
+      res.json({ success: false });
     });
 });
 

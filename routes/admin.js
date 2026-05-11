@@ -520,6 +520,108 @@ router.get('/events/:id', function(req, res) {
     });
 });
 
+// GET /admin/events/:id/invoice — HTML imprimable de la facture commission.
+// Retourne directement un document HTML formaté (Content-Type: text/html)
+// avec print CSS. Le front l'ouvre dans un nouvel onglet, l'admin fait
+// Cmd+P → Save as PDF pour générer le PDF natif navigateur (zéro lib).
+router.get('/events/:id/invoice', function(req, res) {
+  Promise.all([
+    pool.query(
+      'SELECT e.*, u.nom AS organizer_nom, u.prenom AS organizer_prenom, ' +
+      'u.email AS organizer_email, u.phone AS organizer_phone, ' +
+      "(SELECT (value::text)::numeric FROM app_settings WHERE key = 'commission_rate') AS global_rate " +
+      'FROM events e LEFT JOIN users u ON u.id = e.organizer_id WHERE e.id = $1',
+      [req.params.id]
+    ),
+    pool.query(
+      "SELECT COUNT(*)::int AS n, COALESCE(SUM(total_amount), 0)::bigint AS gross, " +
+      "COUNT(*) FILTER (WHERE cancelled_at IS NOT NULL)::int AS cancelled_count, " +
+      "COALESCE(SUM(refund_amount), 0)::bigint AS refunded " +
+      "FROM bookings WHERE event_id = $1 AND statut IN ('confirme', 'annule')",
+      [req.params.id]
+    ),
+  ])
+    .then(function(r) {
+      if (r[0].rows.length === 0) {
+        return res.status(404).send('Événement non trouvé');
+      }
+      var e = r[0].rows[0];
+      var b = r[1].rows[0];
+
+      var commissionRate = e.commission_rate !== null
+        ? parseFloat(e.commission_rate)
+        : parseFloat(e.global_rate);
+      var gross = parseInt(b.gross) || 0;
+      var refunded = parseInt(b.refunded) || 0;
+      var grossNet = gross - refunded;
+      var commission = Math.ceil(grossNet * commissionRate);
+      var invoiceDate = new Date().toLocaleDateString('fr-FR', {
+        day: 'numeric', month: 'long', year: 'numeric',
+      });
+      var invoiceNumber = 'AKW-INV-' + e.id + '-' + new Date().getFullYear();
+
+      function fmt(n) { return new Intl.NumberFormat('fr-FR').format(n || 0) + ' FCFA'; }
+
+      logAudit(req.admin.id, 'event.invoice_view', 'event', e.id, null);
+
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      res.send(
+        '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">' +
+        '<title>Facture commission ' + invoiceNumber + '</title>' +
+        '<style>' +
+        '@page { size: A4; margin: 24mm 20mm; }' +
+        'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; ' +
+        '  color: #0E0B08; line-height: 1.5; max-width: 760px; margin: 0 auto; padding: 24px; }' +
+        '.header { display: flex; justify-content: space-between; border-bottom: 3px solid #D85A2C; padding-bottom: 16px; margin-bottom: 32px; }' +
+        '.brand { font-family: Georgia, serif; font-size: 28px; font-weight: 500; }' +
+        '.brand .accent { color: #D85A2C; }' +
+        '.meta { text-align: right; font-size: 13px; color: #666; }' +
+        'h2 { font-family: Georgia, serif; font-size: 16px; margin: 24px 0 8px; }' +
+        '.row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #E5DDD0; font-size: 14px; }' +
+        '.row.total { font-weight: 600; font-size: 16px; border-bottom: 2px solid #0E0B08; margin-top: 8px; padding-top: 12px; }' +
+        '.row.deduction { color: #A8431F; }' +
+        '.footer { margin-top: 40px; padding-top: 16px; border-top: 1px solid #E5DDD0; font-size: 11px; color: #999; }' +
+        '.print-hint { background: #F4EBDD; padding: 10px 14px; border-radius: 6px; margin-bottom: 24px; font-size: 12px; }' +
+        '@media print { .print-hint { display: none; } }' +
+        '</style></head><body>' +
+        '<div class="print-hint">Cmd+P (ou Ctrl+P) puis "Enregistrer en PDF" pour générer le fichier.</div>' +
+        '<div class="header">' +
+        '  <div class="brand">Akwaba <span class="accent">Admin</span></div>' +
+        '  <div class="meta">' +
+        '    <strong>Facture commission</strong><br>' +
+        '    N° ' + invoiceNumber + '<br>' +
+        '    Émise le ' + invoiceDate +
+        '  </div>' +
+        '</div>' +
+        '<h2>Organisateur</h2>' +
+        '<div class="row"><span>Nom</span><span>' + (e.organizer_prenom || '') + ' ' + (e.organizer_nom || '') + '</span></div>' +
+        '<div class="row"><span>Téléphone</span><span>' + (e.organizer_phone || '—') + '</span></div>' +
+        (e.organizer_email ? '<div class="row"><span>Email</span><span>' + e.organizer_email + '</span></div>' : '') +
+        '<h2>Événement</h2>' +
+        '<div class="row"><span>Titre</span><span>' + e.title + '</span></div>' +
+        '<div class="row"><span>Lieu</span><span>' + e.lieu + '</span></div>' +
+        '<div class="row"><span>Date</span><span>' + e.date + '</span></div>' +
+        '<h2>Décompte financier</h2>' +
+        '<div class="row"><span>Bookings confirmés</span><span>' + b.n + '</span></div>' +
+        '<div class="row"><span>Annulations</span><span>' + b.cancelled_count + '</span></div>' +
+        '<div class="row"><span>Volume brut</span><span>' + fmt(gross) + '</span></div>' +
+        '<div class="row deduction"><span>− Remboursements émis</span><span>' + fmt(refunded) + '</span></div>' +
+        '<div class="row"><span><strong>Volume net</strong></span><span><strong>' + fmt(grossNet) + '</strong></span></div>' +
+        '<div class="row deduction"><span>− Commission Akwaba (' + (commissionRate * 100).toFixed(2) + '%)</span><span>' + fmt(commission) + '</span></div>' +
+        '<div class="row total"><span>Net à reverser à l\'orga</span><span>' + fmt(grossNet - commission) + '</span></div>' +
+        '<div class="footer">' +
+        'Akwaba — Plateforme de billetterie événementielle, Abidjan, Côte d\'Ivoire.<br>' +
+        'Ce document est un récapitulatif interne. Une facture officielle conforme DGI sera émise en fin de période.' +
+        '</div>' +
+        '</body></html>'
+      );
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/events/:id/invoice:', err.message);
+      res.status(500).send('Erreur serveur');
+    });
+});
+
 // PATCH /admin/events/:id/commission-rate — Override le taux de commission
 // d'un event. Body { commission_rate: number|null }. null = revient au défaut
 // global (app_settings.commission_rate). N'affecte que les futurs payouts.
@@ -1812,6 +1914,265 @@ router.patch('/users/:id/payout-account', auth.requireAdminRole(['finance']), fu
 // V2 : intégrer event_view depuis PostHog pour un funnel complet (visite
 // fiche event → start checkout → confirmed).
 
+// GET /admin/analytics/search — Top recherches avec et sans résultats.
+// V1 : top 30 no-result queries (priorité acquisition) + top 20 queries totales.
+router.get('/analytics/search', function(req, res) {
+  Promise.all([
+    // Top no-result queries last 30 days
+    pool.query(
+      "SELECT query_lower AS query, COUNT(*)::int AS searches, " +
+      "COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL)::int AS unique_users, " +
+      "MAX(created_at) AS last_search_at " +
+      "FROM search_queries WHERE result_count = 0 " +
+      "AND created_at >= NOW() - INTERVAL '30 days' " +
+      "GROUP BY query_lower " +
+      "ORDER BY searches DESC LIMIT 30"
+    ),
+    // Top queries en général (peu importe result count)
+    pool.query(
+      "SELECT query_lower AS query, COUNT(*)::int AS searches, " +
+      "COUNT(*) FILTER (WHERE result_count = 0)::int AS no_result_searches, " +
+      "AVG(result_count)::int AS avg_results " +
+      "FROM search_queries " +
+      "WHERE created_at >= NOW() - INTERVAL '30 days' " +
+      "GROUP BY query_lower " +
+      "ORDER BY searches DESC LIMIT 20"
+    ),
+    // Stats globales
+    pool.query(
+      "SELECT COUNT(*)::int AS total, " +
+      "COUNT(*) FILTER (WHERE result_count = 0)::int AS no_result_count, " +
+      "COUNT(DISTINCT user_id) FILTER (WHERE user_id IS NOT NULL)::int AS unique_searchers " +
+      "FROM search_queries " +
+      "WHERE created_at >= NOW() - INTERVAL '30 days'"
+    ),
+  ])
+    .then(function(r) {
+      var stats = r[2].rows[0];
+      res.json({
+        success: true,
+        no_results: r[0].rows.map(function(row) {
+          return {
+            query: row.query,
+            searches: row.searches,
+            unique_users: row.unique_users,
+            last_search_at: row.last_search_at,
+          };
+        }),
+        top_queries: r[1].rows.map(function(row) {
+          return {
+            query: row.query,
+            searches: row.searches,
+            no_result_searches: row.no_result_searches,
+            avg_results: row.avg_results,
+          };
+        }),
+        stats: {
+          total: stats.total,
+          no_result_count: stats.no_result_count,
+          no_result_pct: stats.total > 0
+            ? Math.round((stats.no_result_count / stats.total) * 1000) / 10
+            : 0,
+          unique_searchers: stats.unique_searchers,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/search:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/analytics/attribution — Répartition users par source d'acquisition.
+router.get('/analytics/attribution', function(req, res) {
+  Promise.all([
+    pool.query(
+      "SELECT COALESCE(acquisition_source, 'organic') AS source, " +
+      "COUNT(*)::int AS users_count, " +
+      "COUNT(*) FILTER (WHERE EXISTS ( " +
+      "  SELECT 1 FROM bookings b WHERE b.user_id = users.id AND b.statut = 'confirme' " +
+      "))::int AS paying_users, " +
+      "(SELECT COALESCE(SUM(b.total_amount), 0)::bigint " +
+      "  FROM bookings b WHERE b.user_id = users.id AND b.statut = 'confirme') AS revenue " +
+      "FROM users " +
+      "WHERE role = 'participant' " +
+      "GROUP BY acquisition_source"
+    ),
+    // Référents (parrains) : source = referral
+    pool.query(
+      "SELECT COUNT(*)::int AS referred_users_count, " +
+      "COUNT(DISTINCT parrain_id)::int AS unique_referrers " +
+      "FROM referrals"
+    ),
+  ])
+    .then(function(r) {
+      // Calcul revenue par source via subquery, mais c'est imprécis (somme par user
+      // peut être 0 multiple fois). Reagrégeons proprement.
+      res.json({
+        success: true,
+        by_source: r[0].rows.map(function(row) {
+          return {
+            source: row.source,
+            users_count: row.users_count,
+            paying_users: row.paying_users,
+            conversion_rate: row.users_count > 0
+              ? Math.round((row.paying_users / row.users_count) * 1000) / 10
+              : 0,
+          };
+        }),
+        referral_stats: {
+          referred_users_count: r[1].rows[0].referred_users_count,
+          unique_referrers: r[1].rows[0].unique_referrers,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/attribution:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/analytics/geo — Agrégation des bookings par localisation event.
+// Retourne lat/lng + count + revenue. Le front rend une heatmap Leaflet.
+router.get('/analytics/geo', function(req, res) {
+  pool.query(
+    'SELECT ' +
+    'e.id, e.title, e.lieu, e.latitude, e.longitude, ' +
+    'COUNT(b.id)::int AS bookings_count, ' +
+    'COALESCE(SUM(b.total_amount), 0)::bigint AS revenue ' +
+    'FROM events e ' +
+    "LEFT JOIN bookings b ON b.event_id = e.id AND b.statut = 'confirme' " +
+    "WHERE e.latitude IS NOT NULL AND e.longitude IS NOT NULL " +
+    "AND e.status = 'approved' " +
+    'GROUP BY e.id, e.title, e.lieu, e.latitude, e.longitude ' +
+    'HAVING COUNT(b.id) > 0 ' +
+    'ORDER BY bookings_count DESC LIMIT 200'
+  )
+    .then(function(r) {
+      res.json({
+        success: true,
+        points: r.rows.map(function(row) {
+          return {
+            id: row.id.toString(),
+            title: row.title,
+            lieu: row.lieu,
+            lat: parseFloat(row.latitude),
+            lng: parseFloat(row.longitude),
+            bookings_count: row.bookings_count,
+            revenue: parseInt(row.revenue) || 0,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/geo:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/analytics/hourly — Heatmap day-of-week × hour-of-day des bookings.
+// Retourne matrice 7×24 (dim=0=Lundi à 6=Dimanche, hr=0..23).
+router.get('/analytics/hourly', function(req, res) {
+  pool.query(
+    "SELECT " +
+    // EXTRACT(DOW) renvoie 0=dimanche...6=samedi en PG. On normalise vers
+    // 0=lundi..6=dimanche pour matcher l'usage europe.
+    "((EXTRACT(DOW FROM created_at)::int + 6) % 7) AS day_of_week, " +
+    "EXTRACT(HOUR FROM created_at)::int AS hour_of_day, " +
+    "COUNT(*)::int AS count " +
+    "FROM bookings " +
+    "WHERE statut = 'confirme' " +
+    "AND created_at >= NOW() - INTERVAL '90 days' " +
+    "GROUP BY day_of_week, hour_of_day"
+  )
+    .then(function(r) {
+      // Build matrix[day][hour] = count, défaut 0
+      var matrix = [];
+      for (var d = 0; d < 7; d++) {
+        matrix.push(new Array(24).fill(0));
+      }
+      r.rows.forEach(function(row) {
+        matrix[row.day_of_week][row.hour_of_day] = row.count;
+      });
+      res.json({ success: true, matrix: matrix });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/hourly:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/analytics/ltv — Lifetime Value par user + distribution.
+// V1 simple : top 50 users + buckets de distribution.
+router.get('/analytics/ltv', function(req, res) {
+  Promise.all([
+    // Top 50 users par revenue
+    pool.query(
+      "SELECT u.id, u.nom, u.prenom, u.phone, " +
+      "COUNT(b.id) FILTER (WHERE b.statut = 'confirme')::int AS bookings_count, " +
+      "COALESCE(SUM(b.total_amount) FILTER (WHERE b.statut = 'confirme'), 0)::bigint AS lifetime_value, " +
+      "MAX(b.created_at) FILTER (WHERE b.statut = 'confirme') AS last_booking_at, " +
+      "u.created_at AS signup_at " +
+      "FROM users u LEFT JOIN bookings b ON b.user_id = u.id " +
+      "WHERE u.role = 'participant' " +
+      "GROUP BY u.id, u.nom, u.prenom, u.phone, u.created_at " +
+      "HAVING COUNT(b.id) FILTER (WHERE b.statut = 'confirme') > 0 " +
+      "ORDER BY lifetime_value DESC LIMIT 50"
+    ),
+    // Distribution buckets
+    pool.query(
+      "WITH user_ltv AS ( " +
+      "  SELECT u.id, COALESCE(SUM(b.total_amount) FILTER (WHERE b.statut = 'confirme'), 0)::bigint AS ltv " +
+      "  FROM users u LEFT JOIN bookings b ON b.user_id = u.id " +
+      "  WHERE u.role = 'participant' " +
+      "  GROUP BY u.id " +
+      ") " +
+      "SELECT " +
+      "COUNT(*) FILTER (WHERE ltv = 0)::int AS bucket_0, " +
+      "COUNT(*) FILTER (WHERE ltv > 0 AND ltv < 10000)::int AS bucket_1to10k, " +
+      "COUNT(*) FILTER (WHERE ltv >= 10000 AND ltv < 50000)::int AS bucket_10kto50k, " +
+      "COUNT(*) FILTER (WHERE ltv >= 50000 AND ltv < 100000)::int AS bucket_50kto100k, " +
+      "COUNT(*) FILTER (WHERE ltv >= 100000 AND ltv < 500000)::int AS bucket_100kto500k, " +
+      "COUNT(*) FILTER (WHERE ltv >= 500000)::int AS bucket_500kplus, " +
+      "COALESCE(AVG(ltv) FILTER (WHERE ltv > 0), 0)::bigint AS avg_ltv_paying, " +
+      "COALESCE(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ltv) FILTER (WHERE ltv > 0), 0)::bigint AS median_ltv_paying " +
+      "FROM user_ltv"
+    ),
+  ])
+    .then(function(r) {
+      var dist = r[1].rows[0];
+      res.json({
+        success: true,
+        top_users: r[0].rows.map(function(u) {
+          return {
+            id: u.id.toString(),
+            nom: u.nom, prenom: u.prenom, phone: u.phone,
+            bookings_count: u.bookings_count,
+            lifetime_value: parseInt(u.lifetime_value) || 0,
+            last_booking_at: u.last_booking_at,
+            signup_at: u.signup_at,
+          };
+        }),
+        distribution: {
+          buckets: [
+            { range: '0 FCFA (jamais payé)', count: dist.bucket_0 },
+            { range: '1 — 10K', count: dist.bucket_1to10k },
+            { range: '10K — 50K', count: dist.bucket_10kto50k },
+            { range: '50K — 100K', count: dist.bucket_50kto100k },
+            { range: '100K — 500K', count: dist.bucket_100kto500k },
+            { range: '500K+', count: dist.bucket_500kplus },
+          ],
+          avg_ltv_paying: parseInt(dist.avg_ltv_paying) || 0,
+          median_ltv_paying: parseInt(dist.median_ltv_paying) || 0,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/analytics/ltv:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // GET /admin/analytics/cohort — Matrice cohort retention sur 12 mois.
 router.get('/analytics/cohort', function(req, res) {
   // Cohort = mois d'inscription. Retention = users qui ont fait un
@@ -2262,6 +2623,444 @@ router.patch('/support/tickets/:id', function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur PATCH /admin/support/tickets/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// ADM-FRAUD : Détection passive de patterns suspects
+// ============================================================
+// V1 : queries SQL qui flag des patterns. Pas d'auto-block, juste de la
+// visibilité pour permettre une review manuelle par l'admin. Catégories :
+//   - velocity_high : 5+ bookings d'un même user en <1h
+//   - high_refund_rate : user avec >30% refund rate sur 5+ bookings
+//   - high_cancel_rate : user avec >50% bookings annulés sur 30j
+//   - transaction_reuse : même transaction_id sur multiples bookings
+//   - failed_payment_spike : 5+ paiements failed même user / 24h
+//   - duplicate_phone : 2+ user accounts avec même phone (NE devrait pas
+//     arriver car UNIQUE, mais peut signaler une corruption de données)
+
+router.get('/fraud/alerts', function(req, res) {
+  Promise.all([
+    // 1. Velocity : 5+ bookings même user dernière heure
+    pool.query(
+      "SELECT b.user_id, u.nom, u.prenom, u.phone, " +
+      "COUNT(*)::int AS bookings_count, " +
+      "MAX(b.created_at) AS last_booking_at " +
+      "FROM bookings b JOIN users u ON u.id = b.user_id " +
+      "WHERE b.created_at >= NOW() - INTERVAL '1 hour' " +
+      "GROUP BY b.user_id, u.nom, u.prenom, u.phone " +
+      "HAVING COUNT(*) >= 5 " +
+      "ORDER BY bookings_count DESC LIMIT 20"
+    ),
+    // 2. High refund rate
+    pool.query(
+      "SELECT b.user_id, u.nom, u.prenom, u.phone, " +
+      "COUNT(*)::int AS total_bookings, " +
+      "COUNT(*) FILTER (WHERE b.cancelled_at IS NOT NULL)::int AS cancelled_count, " +
+      "ROUND(COUNT(*) FILTER (WHERE b.cancelled_at IS NOT NULL)::numeric " +
+      "  / NULLIF(COUNT(*), 0) * 100, 1) AS refund_rate " +
+      "FROM bookings b JOIN users u ON u.id = b.user_id " +
+      "GROUP BY b.user_id, u.nom, u.prenom, u.phone " +
+      "HAVING COUNT(*) >= 5 " +
+      "  AND COUNT(*) FILTER (WHERE b.cancelled_at IS NOT NULL)::numeric / COUNT(*) > 0.30 " +
+      "ORDER BY refund_rate DESC LIMIT 20"
+    ),
+    // 3. High cancel rate over 30 days
+    pool.query(
+      "SELECT b.user_id, u.nom, u.prenom, u.phone, " +
+      "COUNT(*)::int AS total_bookings_30d, " +
+      "COUNT(*) FILTER (WHERE b.cancelled_at IS NOT NULL)::int AS cancelled_30d, " +
+      "ROUND(COUNT(*) FILTER (WHERE b.cancelled_at IS NOT NULL)::numeric " +
+      "  / NULLIF(COUNT(*), 0) * 100, 1) AS cancel_rate " +
+      "FROM bookings b JOIN users u ON u.id = b.user_id " +
+      "WHERE b.created_at >= NOW() - INTERVAL '30 days' " +
+      "GROUP BY b.user_id, u.nom, u.prenom, u.phone " +
+      "HAVING COUNT(*) >= 3 " +
+      "  AND COUNT(*) FILTER (WHERE b.cancelled_at IS NOT NULL)::numeric / COUNT(*) > 0.50 " +
+      "ORDER BY cancel_rate DESC LIMIT 20"
+    ),
+    // 4. Transaction_id reused on multiple bookings (anomalie booking-payment)
+    pool.query(
+      "SELECT b.transaction_id, COUNT(*)::int AS bookings_count, " +
+      "ARRAY_AGG(b.id ORDER BY b.created_at)::text[] AS booking_ids, " +
+      "ARRAY_AGG(b.ref ORDER BY b.created_at)::text[] AS refs " +
+      "FROM bookings b WHERE b.transaction_id IS NOT NULL " +
+      "GROUP BY b.transaction_id " +
+      "HAVING COUNT(*) > 1 " +
+      "ORDER BY bookings_count DESC LIMIT 20"
+    ),
+    // 5. Failed payment spike (5+ failed paiements même user / 24h)
+    pool.query(
+      "SELECT b.user_id, u.nom, u.prenom, u.phone, " +
+      "COUNT(*)::int AS failed_count " +
+      "FROM payments p " +
+      "JOIN bookings b ON b.id = p.booking_id " +
+      "JOIN users u ON u.id = b.user_id " +
+      "WHERE p.status NOT IN ('ACCEPTED', 'PENDING') " +
+      "  AND p.created_at >= NOW() - INTERVAL '24 hours' " +
+      "GROUP BY b.user_id, u.nom, u.prenom, u.phone " +
+      "HAVING COUNT(*) >= 5 " +
+      "ORDER BY failed_count DESC LIMIT 20"
+    ),
+    // 6. Duplicate phone (devrait être impossible — UNIQUE constraint)
+    pool.query(
+      "SELECT phone, COUNT(*)::int AS user_count, " +
+      "ARRAY_AGG(id ORDER BY created_at)::text[] AS user_ids " +
+      "FROM users " +
+      "WHERE phone IS NOT NULL AND phone NOT LIKE 'admin-%' " +
+      "GROUP BY phone HAVING COUNT(*) > 1 LIMIT 20"
+    ),
+  ])
+    .then(function(r) {
+      res.json({
+        success: true,
+        alerts: {
+          velocity_high: r[0].rows.map(function(x) {
+            return {
+              user: {
+                id: x.user_id.toString(),
+                nom: x.nom, prenom: x.prenom, phone: x.phone,
+              },
+              bookings_count: x.bookings_count,
+              last_booking_at: x.last_booking_at,
+            };
+          }),
+          high_refund_rate: r[1].rows.map(function(x) {
+            return {
+              user: {
+                id: x.user_id.toString(),
+                nom: x.nom, prenom: x.prenom, phone: x.phone,
+              },
+              total_bookings: x.total_bookings,
+              cancelled_count: x.cancelled_count,
+              refund_rate: parseFloat(x.refund_rate),
+            };
+          }),
+          high_cancel_rate: r[2].rows.map(function(x) {
+            return {
+              user: {
+                id: x.user_id.toString(),
+                nom: x.nom, prenom: x.prenom, phone: x.phone,
+              },
+              total_bookings_30d: x.total_bookings_30d,
+              cancelled_30d: x.cancelled_30d,
+              cancel_rate: parseFloat(x.cancel_rate),
+            };
+          }),
+          transaction_reuse: r[3].rows.map(function(x) {
+            return {
+              transaction_id: x.transaction_id,
+              bookings_count: x.bookings_count,
+              booking_ids: x.booking_ids,
+              refs: x.refs,
+            };
+          }),
+          failed_payment_spike: r[4].rows.map(function(x) {
+            return {
+              user: {
+                id: x.user_id.toString(),
+                nom: x.nom, prenom: x.prenom, phone: x.phone,
+              },
+              failed_count: x.failed_count,
+            };
+          }),
+          duplicate_phone: r[5].rows.map(function(x) {
+            return {
+              phone: x.phone,
+              user_count: x.user_count,
+              user_ids: x.user_ids,
+            };
+          }),
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/fraud/alerts:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// ADM-KYC : Validation identité organisateur
+// ============================================================
+
+// GET /admin/kyc — Liste les orgas avec statut KYC (filtre par status).
+// @query {string} status - 'none' | 'pending' | 'approved' | 'rejected' | 'all' (défaut: 'pending')
+router.get('/kyc', function(req, res) {
+  var status = req.query.status || 'pending';
+  var pag = readPagination(req);
+
+  var clauses = ["role = 'organisateur'"];
+  var params = [];
+  if (status !== 'all') {
+    params.push(status);
+    clauses.push('kyc_status = $' + params.length);
+  }
+  var where = ' WHERE ' + clauses.join(' AND ');
+
+  var listSql =
+    'SELECT u.id, u.nom, u.prenom, u.phone, u.email, ' +
+    'u.kyc_status, u.kyc_submitted_at, u.kyc_reviewed_at, u.kyc_rejection_reason, ' +
+    'u.kyc_documents, u.created_at, ' +
+    "r.prenom || ' ' || r.nom AS reviewed_by_name, " +
+    '(SELECT COUNT(*)::int FROM events WHERE organizer_id = u.id) AS events_count ' +
+    'FROM users u ' +
+    'LEFT JOIN users r ON r.id = u.kyc_reviewed_by' + where +
+    ' ORDER BY u.kyc_submitted_at DESC NULLS LAST, u.created_at DESC LIMIT ' +
+    pag.pageSize + ' OFFSET ' + pag.offset;
+
+  var countSql = 'SELECT COUNT(*)::int AS n FROM users' + where;
+
+  var statusCountsSql =
+    "SELECT COALESCE(kyc_status, 'none') AS status, COUNT(*)::int AS n " +
+    "FROM users WHERE role = 'organisateur' GROUP BY COALESCE(kyc_status, 'none')";
+
+  Promise.all([
+    pool.query(listSql, params),
+    pool.query(countSql, params),
+    pool.query(statusCountsSql),
+  ])
+    .then(function(r) {
+      var statusCounts = { none: 0, pending: 0, approved: 0, rejected: 0 };
+      r[2].rows.forEach(function(row) { statusCounts[row.status] = row.n; });
+
+      res.json({
+        success: true,
+        page: pag.page,
+        page_size: pag.pageSize,
+        total: r[1].rows[0].n,
+        status_counts: statusCounts,
+        items: r[0].rows.map(function(u) {
+          return {
+            id: u.id.toString(),
+            nom: u.nom, prenom: u.prenom, phone: u.phone, email: u.email,
+            kyc_status: u.kyc_status,
+            kyc_submitted_at: u.kyc_submitted_at,
+            kyc_reviewed_at: u.kyc_reviewed_at,
+            kyc_rejection_reason: u.kyc_rejection_reason,
+            kyc_documents: u.kyc_documents || {},
+            reviewed_by_name: u.reviewed_by_name,
+            events_count: u.events_count,
+            created_at: u.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/kyc:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/kyc/:userId — Approve / reject KYC d'un orga.
+// @body {string} kyc_status - 'approved' | 'rejected' | 'pending' | 'none'
+// @body {string?} kyc_rejection_reason (requis si 'rejected')
+router.patch('/kyc/:userId', auth.requireAdminRole(['moderator']), function(req, res) {
+  var STATUS_OK = ['none', 'pending', 'approved', 'rejected'];
+  var newStatus = req.body.kyc_status;
+  if (!STATUS_OK.includes(newStatus)) {
+    return res.status(400).json({
+      success: false,
+      message: 'kyc_status invalide. Valeurs : ' + STATUS_OK.join(', '),
+    });
+  }
+  var reason = req.body.kyc_rejection_reason || null;
+  if (newStatus === 'rejected' && !reason) {
+    return res.status(400).json({
+      success: false,
+      message: 'Raison de rejet requise pour kyc_status=rejected',
+    });
+  }
+
+  pool.query(
+    "UPDATE users SET kyc_status = $1, kyc_rejection_reason = $2, " +
+    "kyc_reviewed_at = NOW(), kyc_reviewed_by = $3, updated_at = NOW() " +
+    "WHERE id = $4 AND role = 'organisateur' " +
+    'RETURNING id, kyc_status',
+    [newStatus, newStatus === 'rejected' ? reason : null, req.admin.id, req.params.userId]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Organisateur non trouvé',
+        });
+      }
+      logAudit(req.admin.id, 'kyc.' + newStatus, 'user', req.params.userId, {
+        rejection_reason: reason,
+      });
+      // Push notif à l'orga pour qu'il sache que son KYC est traité
+      push.notifyUser(req.params.userId, {
+        title: newStatus === 'approved'
+          ? 'Identité validée ✓'
+          : newStatus === 'rejected'
+            ? 'Vérification refusée'
+            : 'Statut KYC mis à jour',
+        body: newStatus === 'approved'
+          ? 'Tu peux maintenant créer tes événements.'
+          : newStatus === 'rejected'
+            ? (reason || 'Re-soumets tes documents depuis l\'app.')
+            : 'Consulte ton profil pour plus de détails.',
+        data: { type: 'kyc_update', kyc_status: newStatus },
+      });
+
+      res.json({
+        success: true,
+        user: { id: r.rows[0].id.toString(), kyc_status: r.rows[0].kyc_status },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/kyc/:userId:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
+// ADM-REFUNDS : Queue de remboursements à virer manuellement
+// ============================================================
+// Workflow : user annule booking → refund_status='pending' (ou 'skip' si 0).
+// Admin finance traite via back-office CinetPay puis marque 'paid' avec proof.
+
+// GET /admin/refunds — Queue paginée + filtres.
+// @query {string} status - 'pending' | 'paid' | 'failed' | 'disputed' | 'skip' | 'all' (défaut: 'pending')
+router.get('/refunds', function(req, res) {
+  var status = req.query.status || 'pending';
+  var pag = readPagination(req);
+
+  var clauses = ['b.cancelled_at IS NOT NULL'];
+  var params = [];
+  if (status !== 'all') {
+    params.push(status);
+    clauses.push('b.refund_status = $' + params.length);
+  }
+
+  var where = ' WHERE ' + clauses.join(' AND ');
+  var listSql =
+    'SELECT b.id, b.ref, b.user_id, ' +
+    'u.nom AS user_nom, u.prenom AS user_prenom, u.phone AS user_phone, u.email AS user_email, ' +
+    'b.event_id, e.title AS event_title, e.start_at AS event_start_at, ' +
+    'b.quantity, b.total_amount, b.refund_amount, b.refund_ratio, ' +
+    'b.cancelled_at, b.cancellation_reason, ' +
+    'b.refund_status, b.refund_paid_at, b.refund_paid_by, ' +
+    "r.prenom || ' ' || r.nom AS refund_paid_by_name, " +
+    'b.refund_proof_url, b.refund_notes ' +
+    'FROM bookings b ' +
+    'JOIN users u ON u.id = b.user_id ' +
+    'LEFT JOIN events e ON e.id = b.event_id ' +
+    'LEFT JOIN users r ON r.id = b.refund_paid_by' + where +
+    ' ORDER BY b.cancelled_at DESC LIMIT ' + pag.pageSize + ' OFFSET ' + pag.offset;
+
+  var countSql = 'SELECT COUNT(*)::int AS n FROM bookings b' + where;
+
+  var statusCountsSql =
+    "SELECT refund_status, COUNT(*)::int AS n FROM bookings " +
+    "WHERE cancelled_at IS NOT NULL AND refund_status IS NOT NULL " +
+    "GROUP BY refund_status";
+
+  Promise.all([
+    pool.query(listSql, params),
+    pool.query(countSql, params),
+    pool.query(statusCountsSql),
+  ])
+    .then(function(r) {
+      var statusCounts = { pending: 0, paid: 0, failed: 0, disputed: 0, skip: 0 };
+      r[2].rows.forEach(function(row) { statusCounts[row.refund_status] = row.n; });
+
+      res.json({
+        success: true,
+        page: pag.page,
+        page_size: pag.pageSize,
+        total: r[1].rows[0].n,
+        status_counts: statusCounts,
+        refunds: r[0].rows.map(function(b) {
+          return {
+            id: b.id.toString(),
+            ref: b.ref,
+            user: {
+              id: b.user_id.toString(),
+              nom: b.user_nom,
+              prenom: b.user_prenom,
+              phone: b.user_phone,
+              email: b.user_email,
+            },
+            event: b.event_id ? {
+              id: b.event_id.toString(),
+              title: b.event_title,
+              start_at: b.event_start_at,
+            } : null,
+            quantity: b.quantity,
+            total_amount: b.total_amount,
+            refund_amount: b.refund_amount,
+            refund_ratio: b.refund_ratio !== null ? parseFloat(b.refund_ratio) : null,
+            cancelled_at: b.cancelled_at,
+            cancellation_reason: b.cancellation_reason,
+            refund_status: b.refund_status,
+            refund_paid_at: b.refund_paid_at,
+            refund_paid_by: b.refund_paid_by ? {
+              id: b.refund_paid_by.toString(),
+              name: b.refund_paid_by_name,
+            } : null,
+            refund_proof_url: b.refund_proof_url,
+            refund_notes: b.refund_notes,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/refunds:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/refunds/:id — Update status + métadonnées.
+// @body {string} refund_status (pending/paid/failed/disputed/skip)
+// @body {string?} refund_proof_url
+// @body {string?} refund_notes
+router.patch('/refunds/:id', auth.requireAdminRole(['finance']), function(req, res) {
+  var STATUS_OK = ['pending', 'paid', 'failed', 'disputed', 'skip'];
+  var newStatus = req.body.refund_status;
+  if (!STATUS_OK.includes(newStatus)) {
+    return res.status(400).json({
+      success: false,
+      message: 'refund_status invalide. Valeurs : ' + STATUS_OK.join(', '),
+    });
+  }
+
+  var proofUrl = req.body.refund_proof_url || null;
+  var notes = req.body.refund_notes || null;
+  // 'paid' → set paid_at + paid_by ; sinon clear paid info si revient en pending.
+  var setPaidAt = newStatus === 'paid' ? 'NOW()' : 'NULL';
+  var setPaidBy = newStatus === 'paid' ? '$3' : 'NULL';
+
+  pool.query(
+    'UPDATE bookings SET refund_status = $1, refund_proof_url = $2, ' +
+    'refund_notes = $4, refund_paid_at = ' + setPaidAt + ', ' +
+    'refund_paid_by = ' + setPaidBy + ', updated_at = NOW() ' +
+    'WHERE id = $5 AND cancelled_at IS NOT NULL RETURNING id, refund_status',
+    [newStatus, proofUrl, req.admin.id, notes, req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'Booking annulé non trouvé',
+        });
+      }
+      logAudit(req.admin.id, 'refund.' + newStatus, 'booking', req.params.id, {
+        new_status: newStatus,
+        proof_url: !!proofUrl,
+      });
+      res.json({
+        success: true,
+        refund: {
+          id: r.rows[0].id.toString(),
+          refund_status: r.rows[0].refund_status,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/refunds/:id:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });

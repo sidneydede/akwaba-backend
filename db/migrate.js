@@ -524,6 +524,84 @@ CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticke
 -- N'affecte que les futurs payouts — les payouts déjà créés gardent leur\n\
 -- commission_amount snapshotté.\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS commission_rate DECIMAL(4,3);\n\
+\n\
+-- ============================================================\n\
+-- ADM-REFUND-QUEUE : Workflow remboursement manuel CinetPay\n\
+-- ============================================================\n\
+-- Quand un user annule un booking (POST /bookings/:id/cancel), refund_amount\n\
+-- est calculé selon la politique 48h/24h. Mais le VIRAGE effectif vers le\n\
+-- user reste manuel (back-office CinetPay). Ces colonnes pistent l'état du\n\
+-- remboursement post-annulation.\n\
+--   pending  = annulé mais pas encore viré\n\
+--   paid     = viré, admin a marqué comme fait (avec proof_url optionnel)\n\
+--   failed   = tentative virement échouée\n\
+--   disputed = user conteste (n'a pas reçu le virement)\n\
+--   skip     = pas de virement nécessaire (refund_amount = 0, annulation J-)\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_status VARCHAR(20);\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_paid_at TIMESTAMP;\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_paid_by INTEGER REFERENCES users(id);\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_proof_url TEXT;\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_notes TEXT;\n\
+\n\
+-- Backfill : tous les bookings cancelled existants avec refund_amount > 0\n\
+-- passent en 'pending' (admin devra les traiter). Si refund_amount = 0, skip.\n\
+UPDATE bookings SET refund_status = CASE\n\
+  WHEN refund_amount > 0 THEN 'pending'\n\
+  ELSE 'skip'\n\
+END WHERE cancelled_at IS NOT NULL AND refund_status IS NULL;\n\
+\n\
+CREATE INDEX IF NOT EXISTS idx_bookings_refund_queue ON bookings(refund_status, cancelled_at DESC) WHERE refund_status IS NOT NULL;\n\
+\n\
+-- ============================================================\n\
+-- ADM-KYC : Vérification d'identité pour les organisateurs\n\
+-- ============================================================\n\
+-- Un orga doit être 'approved' avant de pouvoir créer un event (anti-fraude\n\
+-- au lancement public). Status :\n\
+--   none      = jamais soumis (orgas legacy, lancement)\n\
+--   pending   = a soumis pièces, attente review admin\n\
+--   approved  = validé, peut créer events\n\
+--   rejected  = refusé (avec raison), peut resoumettre\n\
+-- kyc_documents JSONB pour stocker URLs Cloudinary des docs.\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_status VARCHAR(20);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_submitted_at TIMESTAMP;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_reviewed_at TIMESTAMP;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_reviewed_by INTEGER REFERENCES users(id);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_rejection_reason TEXT;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS kyc_documents JSONB DEFAULT '{}';\n\
+\n\
+-- Backfill : les orgas existants passent à 'approved' (grandfathered).\n\
+-- Les nouveaux organisateurs partiront de 'none' et devront passer KYC.\n\
+UPDATE users SET kyc_status = 'approved', kyc_reviewed_at = NOW()\n\
+  WHERE role = 'organisateur' AND kyc_status IS NULL;\n\
+\n\
+CREATE INDEX IF NOT EXISTS idx_users_kyc_status ON users(kyc_status, kyc_submitted_at DESC) WHERE kyc_status IS NOT NULL;\n\
+\n\
+-- ============================================================\n\
+-- ADM-SEARCH-LOG : Log des recherches utilisateurs (signal acquisition)\n\
+-- ============================================================\n\
+-- Sert à identifier les requêtes qui retournent 0 résultat = events/artistes\n\
+-- à acquérir prioritairement. Auto-cleanup conseillé après 90 jours (retention).\n\
+CREATE TABLE IF NOT EXISTS search_queries (\n\
+  id SERIAL PRIMARY KEY,\n\
+  query TEXT NOT NULL,\n\
+  query_lower TEXT GENERATED ALWAYS AS (LOWER(TRIM(query))) STORED,\n\
+  user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,\n\
+  result_count INTEGER NOT NULL DEFAULT 0,\n\
+  acquisition_source VARCHAR(40),\n\
+  created_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_search_queries_lower ON search_queries(query_lower, result_count, created_at DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_search_queries_no_result ON search_queries(query_lower) WHERE result_count = 0;\n\
+\n\
+-- ============================================================\n\
+-- ADM-ATTRIBUTION : Source d'acquisition par user\n\
+-- ============================================================\n\
+-- À l'inscription, on capture utm_source/medium si présent dans le deeplink\n\
+-- (ex: ?utm_source=facebook&utm_medium=ad). Sinon 'organic'.\n\
+-- referral_code source connue séparément via table referrals.\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_source VARCHAR(40);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_medium VARCHAR(40);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_campaign VARCHAR(80);\n\
 ";
 
 console.log('Migration en cours...');
