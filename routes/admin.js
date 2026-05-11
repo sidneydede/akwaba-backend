@@ -227,6 +227,7 @@ router.get('/me', function(req, res) {
           email: req.admin.email,
           phone: req.admin.phone,
           role: req.admin.role,
+          admin_role: req.admin.admin_role || 'super_admin',
           totp_enabled: !!totpEnabled,
           must_setup_2fa: !totpEnabled
         }
@@ -516,7 +517,7 @@ router.get('/events/:id', function(req, res) {
 });
 
 // PATCH /admin/events/:id/approve — Approuver un event (le rend visible publiquement)
-router.patch('/events/:id/approve', function(req, res) {
+router.patch('/events/:id/approve', auth.requireAdminRole(['moderator']), function(req, res) {
   pool.query(
     "UPDATE events SET status = 'approved', moderated_by = $1, moderated_at = NOW(), rejection_reason = NULL WHERE id = $2 RETURNING id, title, status",
     [req.admin.id, req.params.id]
@@ -540,7 +541,7 @@ router.patch('/events/:id/approve', function(req, res) {
 
 // PATCH /admin/events/:id/reject — Rejeter un event avec raison
 // @body {string} reason
-router.patch('/events/:id/reject', function(req, res) {
+router.patch('/events/:id/reject', auth.requireAdminRole(['moderator']), function(req, res) {
   var reason = (req.body.reason || '').trim();
   if (!reason) {
     return res.status(400).json({ success: false, message: 'Raison du rejet requise' });
@@ -595,7 +596,7 @@ router.get('/users', function(req, res) {
   var where = clauses.length > 0 ? ' WHERE ' + clauses.join(' AND ') : '';
 
   var listSql =
-    'SELECT id, nom, prenom, phone, email, role, suspended_at, suspended_reason, last_login_at, created_at ' +
+    'SELECT id, nom, prenom, phone, email, role, admin_role, suspended_at, suspended_reason, last_login_at, created_at ' +
     'FROM users' + where +
     ' ORDER BY created_at DESC LIMIT ' + pag.pageSize + ' OFFSET ' + pag.offset;
 
@@ -616,6 +617,7 @@ router.get('/users', function(req, res) {
             phone: row.phone,
             email: row.email,
             role: row.role,
+            admin_role: row.admin_role,
             suspended_at: row.suspended_at,
             suspended_reason: row.suspended_reason,
             last_login_at: row.last_login_at,
@@ -636,7 +638,7 @@ router.get('/users/:id', function(req, res) {
 
   Promise.all([
     pool.query(
-      'SELECT id, nom, prenom, phone, email, role, suspended_at, suspended_reason, last_login_at, created_at FROM users WHERE id = $1',
+      'SELECT id, nom, prenom, phone, email, role, admin_role, suspended_at, suspended_reason, last_login_at, created_at FROM users WHERE id = $1',
       [userId]
     ),
     pool.query(
@@ -663,6 +665,7 @@ router.get('/users/:id', function(req, res) {
           phone: u.phone,
           email: u.email,
           role: u.role,
+          admin_role: u.admin_role,
           suspended_at: u.suspended_at,
           suspended_reason: u.suspended_reason,
           last_login_at: u.last_login_at,
@@ -701,7 +704,7 @@ router.get('/users/:id', function(req, res) {
 
 // PATCH /admin/users/:id/suspend — Suspendre un compte (refus connexion)
 // @body {string} reason
-router.patch('/users/:id/suspend', function(req, res) {
+router.patch('/users/:id/suspend', auth.requireAdminRole(['moderator']), function(req, res) {
   var reason = (req.body.reason || '').trim();
   if (!reason) {
     return res.status(400).json({ success: false, message: 'Raison de suspension requise' });
@@ -729,7 +732,7 @@ router.patch('/users/:id/suspend', function(req, res) {
 });
 
 // PATCH /admin/users/:id/reactivate — Lève la suspension
-router.patch('/users/:id/reactivate', function(req, res) {
+router.patch('/users/:id/reactivate', auth.requireAdminRole(['moderator']), function(req, res) {
   pool.query(
     'UPDATE users SET suspended_at = NULL, suspended_reason = NULL WHERE id = $1 AND suspended_at IS NOT NULL RETURNING id',
     [req.params.id]
@@ -867,7 +870,7 @@ router.get('/payments/:id', function(req, res) {
 // POST /admin/payments/:id/manual-refund — Marque un paiement remboursé manuellement
 // (audit-log only ; le vrai remboursement se fait via le back-office CinetPay).
 // @body {string} reason
-router.post('/payments/:id/manual-refund', function(req, res) {
+router.post('/payments/:id/manual-refund', auth.requireAdminRole(['finance']), function(req, res) {
   var reason = (req.body.reason || '').trim();
   if (!reason) {
     return res.status(400).json({ success: false, message: 'Raison requise' });
@@ -1067,7 +1070,7 @@ router.get('/payouts/:id', function(req, res) {
 // POST /admin/events/:id/schedule-payout — Crée un reversement pour un event
 // Calcule gross/commission/fees/net depuis les bookings 'confirme' et insère un payout
 // 'scheduled' avec scheduled_at = end_at + escrow_hours (défaut 48h).
-router.post('/events/:id/schedule-payout', function(req, res) {
+router.post('/events/:id/schedule-payout', auth.requireAdminRole(['finance']), function(req, res) {
   var eventId = req.params.id;
 
   Promise.all([
@@ -1170,7 +1173,7 @@ router.post('/events/:id/schedule-payout', function(req, res) {
 // le transfer mobile money via CinetPay Transfer API. Sinon mode manuel : l'admin
 // finance fait le virement via back-office CinetPay et cette route ne trace que.
 // @body {string} notes - Note optionnelle
-router.post('/payouts/:id/release', function(req, res) {
+router.post('/payouts/:id/release', auth.requireAdminRole(['finance']), function(req, res) {
   var notes = (req.body.notes || '').trim();
 
   pool.query(
@@ -1252,7 +1255,7 @@ router.post('/payouts/:id/release', function(req, res) {
 
 // POST /admin/payouts/:id/block — Bloque un reversement suspect avec raison
 // @body {string} reason
-router.post('/payouts/:id/block', function(req, res) {
+router.post('/payouts/:id/block', auth.requireAdminRole(['finance']), function(req, res) {
   var reason = (req.body.reason || '').trim();
   if (!reason) {
     return res.status(400).json({ success: false, message: 'Raison du blocage requise' });
@@ -1280,7 +1283,7 @@ router.post('/payouts/:id/block', function(req, res) {
 });
 
 // POST /admin/payouts/:id/unblock — Débloque (remet en 'scheduled')
-router.post('/payouts/:id/unblock', function(req, res) {
+router.post('/payouts/:id/unblock', auth.requireAdminRole(['finance']), function(req, res) {
   pool.query(
     "UPDATE payouts SET status = 'scheduled', block_reason = NULL, updated_at = NOW() " +
     "WHERE id = $1 AND status = 'blocked' RETURNING id",
@@ -1337,7 +1340,7 @@ router.get('/banners', function(req, res) {
 // POST /admin/banners — Crée une bannière
 // @body {string} title, {string} image_url, {string} link_type ('event'|'url'|'category'),
 //        {string} link_target, {number} position, {string?} subtitle, {string?} active_from, active_until
-router.post('/banners', function(req, res) {
+router.post('/banners', auth.requireAdminRole(['moderator']), function(req, res) {
   var b = req.body;
   if (!b.title || !b.image_url) {
     return res.status(400).json({ success: false, message: 'title et image_url requis' });
@@ -1364,7 +1367,7 @@ router.post('/banners', function(req, res) {
 });
 
 // PATCH /admin/banners/:id — Met à jour une bannière (champs partiels)
-router.patch('/banners/:id', function(req, res) {
+router.patch('/banners/:id', auth.requireAdminRole(['moderator']), function(req, res) {
   var fields = [];
   var params = [];
   var allowed = ['title', 'subtitle', 'image_url', 'link_type', 'link_target',
@@ -1398,7 +1401,7 @@ router.patch('/banners/:id', function(req, res) {
 });
 
 // DELETE /admin/banners/:id — Supprime une bannière
-router.delete('/banners/:id', function(req, res) {
+router.delete('/banners/:id', auth.requireAdminRole(['moderator']), function(req, res) {
   pool.query('DELETE FROM banners WHERE id = $1 RETURNING id', [req.params.id])
     .then(function(r) {
       if (r.rowCount === 0) {
@@ -1415,7 +1418,7 @@ router.delete('/banners/:id', function(req, res) {
 
 // PATCH /admin/events/:id/feature — Active/désactive le badge "À la une"
 // @body {boolean} is_featured, {string?} featured_until - ISO date (défaut: +7j)
-router.patch('/events/:id/feature', function(req, res) {
+router.patch('/events/:id/feature', auth.requireAdminRole(['moderator']), function(req, res) {
   var isFeatured = !!req.body.is_featured;
   var until = req.body.featured_until;
   if (isFeatured && !until) {
@@ -1443,7 +1446,7 @@ router.patch('/events/:id/feature', function(req, res) {
 // POST /admin/notifications/broadcast — Envoie une notification push à un segment
 // @body {string} title, {string} body, {string} segment ('all'|'role'),
 //        {string?} segment_value, {object?} data
-router.post('/notifications/broadcast', function(req, res) {
+router.post('/notifications/broadcast', auth.requireAdminRole(['moderator']), function(req, res) {
   var title = (req.body.title || '').trim();
   var body = (req.body.body || '').trim();
   var segment = req.body.segment || 'all';
@@ -1620,7 +1623,7 @@ router.get('/settings', function(req, res) {
 
 // PATCH /admin/settings/:key — Met à jour la valeur d'un paramètre
 // @body {any} value - JSON quelconque (number, string, bool, object)
-router.patch('/settings/:key', function(req, res) {
+router.patch('/settings/:key', auth.requireAdminRole([]), function(req, res) {
   if (req.body.value === undefined) {
     return res.status(400).json({ success: false, message: 'value requis' });
   }
@@ -1666,9 +1669,59 @@ router.patch('/settings/:key', function(req, res) {
     });
 });
 
+// PATCH /admin/users/:id/admin-role — Change le rôle admin d'un user.
+// Réservé super_admin. Set 'super_admin'|'moderator'|'finance'|'support' OU
+// null (révoque l'admin). Auto-protection : un super_admin ne peut pas se
+// dégrader lui-même (sinon plus aucun super_admin dans le système).
+// @body {string|null} admin_role
+router.patch('/users/:id/admin-role', auth.requireAdminRole([]), function(req, res) {
+  var ALLOWED = ['super_admin', 'moderator', 'finance', 'support'];
+  var newRole = req.body.admin_role === null || req.body.admin_role === ''
+    ? null
+    : req.body.admin_role;
+  if (newRole !== null && ALLOWED.indexOf(newRole) === -1) {
+    return res.status(400).json({
+      success: false,
+      message: 'admin_role doit être null ou un de : ' + ALLOWED.join(', '),
+    });
+  }
+  if (parseInt(req.params.id) === req.admin.id && newRole !== 'super_admin') {
+    return res.status(400).json({
+      success: false,
+      message: 'Un super_admin ne peut pas dégrader son propre compte',
+    });
+  }
+
+  pool.query(
+    "UPDATE users SET admin_role = $1, role = CASE WHEN $1 IS NULL THEN 'participant' ELSE 'admin' END, " +
+    'updated_at = NOW() WHERE id = $2 RETURNING id, role, admin_role',
+    [newRole, req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Utilisateur non trouvé' });
+      }
+      logAudit(req.admin.id, 'user.admin_role_update', 'user', req.params.id, {
+        new_role: newRole,
+      });
+      res.json({
+        success: true,
+        user: {
+          id: r.rows[0].id.toString(),
+          role: r.rows[0].role,
+          admin_role: r.rows[0].admin_role,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/users/:id/admin-role:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // PATCH /admin/users/:id/payout-account — Définit le compte de reversement d'un orga
 // @body {object} payout_account - { provider, number, name, ...}
-router.patch('/users/:id/payout-account', function(req, res) {
+router.patch('/users/:id/payout-account', auth.requireAdminRole(['finance']), function(req, res) {
   var account = req.body.payout_account;
   if (!account || typeof account !== 'object') {
     return res.status(400).json({ success: false, message: 'payout_account requis (objet JSON)' });
@@ -1964,7 +2017,7 @@ var BULK_MAX = 100;
 // POST /admin/events/bulk-approve — Approuve plusieurs events en attente.
 // Skip ceux qui ne sont pas 'pending' (status != pending → ignoré silencieusement).
 // @body {number[]} event_ids
-router.post('/events/bulk-approve', function(req, res) {
+router.post('/events/bulk-approve', auth.requireAdminRole(['moderator']), function(req, res) {
   var ids = (req.body.event_ids || []).map(function(x) { return parseInt(x); }).filter(Boolean);
   if (ids.length === 0) {
     return res.status(400).json({ success: false, message: 'event_ids requis (array non vide)' });
@@ -2006,7 +2059,7 @@ router.post('/events/bulk-approve', function(req, res) {
 // POST /admin/events/bulk-reject — Rejette plusieurs events en attente
 // avec la même raison. Skip ceux pas 'pending'.
 // @body {number[]} event_ids, {string} reason
-router.post('/events/bulk-reject', function(req, res) {
+router.post('/events/bulk-reject', auth.requireAdminRole(['moderator']), function(req, res) {
   var ids = (req.body.event_ids || []).map(function(x) { return parseInt(x); }).filter(Boolean);
   var reason = (req.body.reason || '').trim();
   if (ids.length === 0 || !reason) {
@@ -2041,7 +2094,7 @@ router.post('/events/bulk-reject', function(req, res) {
 // POST /admin/users/bulk-suspend — Suspend plusieurs users avec la même raison.
 // Skip ceux déjà suspendus + refuse de suspendre l'admin qui fait la requête.
 // @body {number[]} user_ids, {string} reason
-router.post('/users/bulk-suspend', function(req, res) {
+router.post('/users/bulk-suspend', auth.requireAdminRole(['moderator']), function(req, res) {
   var ids = (req.body.user_ids || []).map(function(x) { return parseInt(x); }).filter(Boolean);
   var reason = (req.body.reason || '').trim();
   if (ids.length === 0 || !reason) {
@@ -2209,7 +2262,7 @@ router.get('/users/:id/health', function(req, res) {
 // POST /admin/digest/send-now — Force la génération + envoi du digest J-1
 // immédiatement (au lieu d'attendre 8h UTC). Utile en debug ou si le cron
 // a manqué la fenêtre (Render free tier sleep).
-router.post('/digest/send-now', function(req, res) {
+router.post('/digest/send-now', auth.requireAdminRole([]), function(req, res) {
   var digest = require('../jobs/admin-digest');
   digest.sendDigestForToday()
     .then(function(result) {

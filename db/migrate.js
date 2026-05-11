@@ -465,6 +465,18 @@ CREATE TABLE IF NOT EXISTS admin_notes (\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_admin_notes_target ON admin_notes(target_type, target_id, created_at DESC);\n\
 CREATE INDEX IF NOT EXISTS idx_admin_notes_author ON admin_notes(author_id, created_at DESC);\n\
+\n\
+-- ============================================================\n\
+-- ADM-RBAC : Rôles fins pour les comptes admin\n\
+-- ============================================================\n\
+-- 4 rôles admin :\n\
+--   super_admin = accès complet (par défaut, créateurs)\n\
+--   moderator   = events, users (suspend), broadcasts, banners — pas de finance\n\
+--   finance     = payments, payouts, refunds, finance, settings (read) — pas modération\n\
+--   support     = lecture user/event/payment + tickets support (read/write tickets)\n\
+-- NULL pour les non-admins. Backfill : tous les admins existants → super_admin.\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_role VARCHAR(20);\n\
+UPDATE users SET admin_role = 'super_admin' WHERE role = 'admin' AND admin_role IS NULL;\n\
 ";
 
 console.log('Migration en cours...');

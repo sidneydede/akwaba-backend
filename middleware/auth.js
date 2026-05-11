@@ -131,10 +131,11 @@ function requireOrganizer(req, res, next) {
 }
 
 // Vérifie que l'utilisateur authentifié est un admin et n'est pas suspendu.
-// À chaîner après authMiddleware. Pose req.admin = { id, nom, prenom, email, role }.
+// À chaîner après authMiddleware. Pose req.admin = { id, nom, prenom, email,
+// role, admin_role }.
 function requireAdmin(req, res, next) {
   pool.query(
-    'SELECT id, nom, prenom, phone, email, role, suspended_at FROM users WHERE id = $1',
+    'SELECT id, nom, prenom, phone, email, role, admin_role, suspended_at FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -155,6 +156,29 @@ function requireAdmin(req, res, next) {
       console.error('Erreur requireAdmin:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
+}
+
+// Factory : vérifie que req.admin.admin_role est dans la liste autorisée.
+// À chaîner APRÈS requireAdmin. super_admin est implicitement autorisé sur
+// tout — la liste n'a besoin de mentionner que les autres rôles.
+// Usage : router.post('/foo', requireAdminRole(['moderator']), handler);
+function requireAdminRole(allowedRoles) {
+  return function(req, res, next) {
+    if (!req.admin) {
+      return res.status(500).json({
+        success: false,
+        message: 'requireAdminRole utilisé sans requireAdmin préalable',
+      });
+    }
+    var role = req.admin.admin_role;
+    if (role === 'super_admin' || (allowedRoles && allowedRoles.indexOf(role) !== -1)) {
+      return next();
+    }
+    res.status(403).json({
+      success: false,
+      message: 'Permission insuffisante. Requis : ' + allowedRoles.join(' ou ') + ' (vous êtes ' + (role || 'sans rôle') + ').',
+    });
+  };
 }
 
 // Génère un token "purpose-scoped" — utilisé pour le challenge 2FA entre
@@ -235,6 +259,7 @@ module.exports = {
   adminAuthMiddleware: adminAuthMiddleware,
   requireOrganizer: requireOrganizer,
   requireAdmin: requireAdmin,
+  requireAdminRole: requireAdminRole,
   hashPassword: hashPassword,
   verifyPassword: verifyPassword,
   ADMIN_TOKEN_TTL_MS: ADMIN_TOKEN_TTL_MS,
