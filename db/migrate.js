@@ -393,6 +393,28 @@ CREATE TABLE IF NOT EXISTS waitlists (\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_waitlists_event_queue ON waitlists(event_id, joined_at ASC);\n\
 CREATE INDEX IF NOT EXISTS idx_waitlists_user ON waitlists(user_id);\n\
+\n\
+-- ============================================================\n\
+-- TEAM-01 : Multi-organisateurs (equipe scan only)\n\
+-- ============================================================\n\
+-- L'orga proprietaire d'un event peut inviter d'autres users a aider au\n\
+-- scan le jour J (portiers, assistants). Ces 'staff' n'ont pas acces a\n\
+-- l'edition ni aux finances, juste au scanner.\n\
+-- Role 'scanner' pour V1. Roles futurs possibles : 'co_orga', 'box_office'.\n\
+-- L'invitation se fait par numero de telephone : si l'user existe deja, on\n\
+-- ajoute direct ; sinon on creee un user pending qui sera lie au compte si\n\
+-- la personne s'inscrit avec ce phone.\n\
+CREATE TABLE IF NOT EXISTS event_staff (\n\
+  id SERIAL PRIMARY KEY,\n\
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  role VARCHAR(20) NOT NULL DEFAULT 'scanner',\n\
+  invited_by INTEGER REFERENCES users(id),\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  UNIQUE (event_id, user_id)\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_event_staff_user ON event_staff(user_id);\n\
+CREATE INDEX IF NOT EXISTS idx_event_staff_event ON event_staff(event_id);\n\
 ";
 
 console.log('Migration en cours...');

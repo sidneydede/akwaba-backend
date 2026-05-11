@@ -227,16 +227,25 @@ router.get('/recommended', function(req, res) {
     });
 });
 
-// GET /events/mine — Liste les événements créés par l'organisateur connecté
-// Inclut places_vendues (places_total - places_restantes) et revenue (somme des bookings 'confirme').
-router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+// GET /events/mine — Liste les événements de l'organisateur connecté.
+// Inclut aussi les events ou je suis dans event_staff (TEAM-01) avec un
+// flag my_role ('owner' | 'scanner') pour que le front puisse adapter l'UI
+// (cacher edit/finances pour scanner only).
+//
+// Permission : tout user authentifie (le scope est filtre par WHERE).
+// On ne requiert plus role=organisateur global car les staff peuvent etre
+// de simples participants.
+router.get('/mine', auth.authMiddleware, function(req, res) {
   pool.query(
     'SELECT e.id, e.title, e.description, e.category, e.date, e.lieu, e.prix, e.prix_display, ' +
     'e.emoji, e.color, e.chaud, e.image_url, e.places_total, e.places_restantes, ' +
     'e.latitude, e.longitude, e.created_at, e.status, e.rejection_reason, ' +
     '(e.places_total - e.places_restantes) AS places_vendues, ' +
-    "COALESCE((SELECT SUM(total_amount) FROM bookings WHERE event_id = e.id AND statut = 'confirme'), 0) AS revenue " +
-    'FROM events e WHERE e.organizer_id = $1 ORDER BY e.created_at DESC',
+    "COALESCE((SELECT SUM(total_amount) FROM bookings WHERE event_id = e.id AND statut = 'confirme'), 0) AS revenue, " +
+    "CASE WHEN e.organizer_id = $1 THEN 'owner' ELSE 'scanner' END AS my_role " +
+    'FROM events e WHERE e.organizer_id = $1 ' +
+    'OR EXISTS (SELECT 1 FROM event_staff s WHERE s.event_id = e.id AND s.user_id = $1) ' +
+    'ORDER BY e.created_at DESC',
     [req.userId]
   )
     .then(function(result) {
@@ -262,7 +271,8 @@ router.get('/mine', auth.authMiddleware, auth.requireOrganizer, function(req, re
           revenue: parseInt(row.revenue) || 0,
           status: row.status,
           rejection_reason: row.rejection_reason,
-          created_at: row.created_at
+          created_at: row.created_at,
+          my_role: row.my_role,
         };
       });
       res.json({ success: true, events: events });

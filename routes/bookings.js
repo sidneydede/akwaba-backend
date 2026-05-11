@@ -258,13 +258,30 @@ router.get('/', auth.authMiddleware, function(req, res) {
     });
 });
 
+// Helper : verifie que req.userId est autorise a scanner les billets de
+// l'event (organizer_id OU event_staff entry). Retourne une promesse qui
+// resolve true/false. Utilise par /check-in et /check-in-batch pour
+// supporter les "scanner only" assistants (TEAM-01).
+function userCanScanEvent(userId, eventId) {
+  return pool.query(
+    'SELECT 1 FROM events WHERE id = $1 AND organizer_id = $2 ' +
+    'UNION SELECT 1 FROM event_staff WHERE event_id = $1 AND user_id = $2 ' +
+    'LIMIT 1',
+    [eventId, userId]
+  ).then(function(result) { return result.rows.length > 0; });
+}
+
 // POST /bookings/check-in — Scan QR à l'entrée par l'organisateur
 // Webapp orga décode le QR (AKWABA-BILLET:AKW-XXXXXXXX.HHHHHHHHHHHHHHHH) et envoie
-// le payload ici. Le serveur vérifie la signature HMAC, l'ownership orga, le statut,
-// puis marque le billet 'utilise'.
+// le payload ici. Le serveur vérifie la signature HMAC, l'ownership orga
+// OU staff entry (TEAM-01), le statut, puis marque le billet 'utilise'.
 // @body {string} payload - Contenu QR signé: 'AKW-XXXXXXXX.HHHHHHHHHHHHHHHH'
 //   (compat ancien format : accepte aussi {ref} pour les billets pré-signature ; bientôt obsolète)
-router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+router.post('/check-in', auth.authMiddleware, function(req, res) {
+  // req.user n'est pas pose ici (on a remplace requireOrganizer par
+  // authMiddleware seul pour permettre aux staff de scanner). On construit
+  // un user simple a partir de req.userId pour les usages downstream.
+  req.user = { id: req.userId };
   var ref;
 
   // Nouveau format signé (obligatoire à terme).
@@ -297,6 +314,7 @@ router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(re
   }
 
   // 1) Lookup billet + event + participant en une seule requête
+  var b;
   pool.query(
     'SELECT b.id, b.statut, b.quantity, b.utilise_at, ' +
     'e.id AS event_id, e.organizer_id, e.title AS event_title, ' +
@@ -309,86 +327,82 @@ router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(re
   )
     .then(function(result) {
       if (result.rows.length === 0) {
-        return res.status(404).json({
+        res.status(404).json({
           success: false,
           code: 'NOT_FOUND',
           message: 'Aucun billet ne correspond à cette référence.'
         });
+        return null;
       }
-
-      var b = result.rows[0];
-
-      // 2) Ownership : seul l'orga propriétaire de l'event peut check-in
-      if (b.organizer_id !== req.user.id) {
-        return res.status(403).json({
+      b = result.rows[0];
+      // 2) Authorization : owner OR staff (TEAM-01).
+      return userCanScanEvent(req.user.id, b.event_id);
+    })
+    .then(function(allowed) {
+      if (allowed === null) return null;  // already responded with 404
+      if (!allowed) {
+        res.status(403).json({
           success: false,
           code: 'NOT_YOUR_EVENT',
-          message: 'Ce billet appartient à un événement d\'un autre organisateur.'
+          message: 'Ce billet appartient à un événement sur lequel tu n\'es pas autorisé à scanner.'
         });
+        return null;
       }
-
       // 3) Statuts non-checkin-able
       if (b.statut === 'utilise') {
-        return res.status(409).json({
+        res.status(409).json({
           success: false,
           code: 'ALREADY_USED',
           message: 'Billet déjà scanné.',
           utilise_at: b.utilise_at,
           participant: { nom: b.nom, prenom: b.prenom }
         });
+        return null;
       }
       if (b.statut === 'annule') {
-        return res.status(410).json({
-          success: false,
-          code: 'CANCELLED',
-          message: 'Billet annulé.'
-        });
+        res.status(410).json({ success: false, code: 'CANCELLED', message: 'Billet annulé.' });
+        return null;
       }
       if (b.statut === 'en_attente') {
-        return res.status(402).json({
-          success: false,
-          code: 'PAYMENT_PENDING',
-          message: 'Paiement non confirmé pour ce billet.'
-        });
+        res.status(402).json({ success: false, code: 'PAYMENT_PENDING', message: 'Paiement non confirmé pour ce billet.' });
+        return null;
       }
       if (b.statut !== 'confirme') {
-        return res.status(409).json({
-          success: false,
-          code: 'INVALID_STATUS',
-          message: 'Statut billet inattendu : ' + b.statut
-        });
+        res.status(409).json({ success: false, code: 'INVALID_STATUS', message: 'Statut billet inattendu : ' + b.statut });
+        return null;
       }
-
       // 4) UPDATE conditionnel : protège contre la race condition double-scan.
-      //    Si un autre scan passe entre le SELECT et l'UPDATE, rowCount=0 → on renvoie 409.
       return pool.query(
         "UPDATE bookings SET statut = 'utilise', utilise_at = NOW(), checkin_by = $2 " +
         "WHERE id = $1 AND statut = 'confirme' RETURNING utilise_at",
         [b.id, req.user.id]
-      )
-        .then(function(updResult) {
-          if (updResult.rowCount === 0) {
-            return res.status(409).json({
-              success: false,
-              code: 'ALREADY_USED',
-              message: 'Billet scanné juste à l\'instant par un autre scan.'
-            });
-          }
-          res.json({
-            success: true,
-            checkin: {
-              ref: ref,
-              participant: { nom: b.nom, prenom: b.prenom },
-              places: b.quantity,
-              event_title: b.event_title,
-              utilise_at: updResult.rows[0].utilise_at
-            }
-          });
+      );
+    })
+    .then(function(updResult) {
+      if (updResult === null || !updResult) return;
+      if (updResult.rowCount === 0) {
+        return res.status(409).json({
+          success: false,
+          code: 'ALREADY_USED',
+          message: 'Billet scanné juste à l\'instant par un autre scan.'
         });
+      }
+      res.json({
+        success: true,
+        checkin: {
+          ref: ref,
+          participant: { nom: b.nom, prenom: b.prenom },
+          places: b.quantity,
+          event_title: b.event_title,
+          utilise_at: updResult.rows[0].utilise_at
+        }
+      });
     })
     .catch(function(err) {
       console.error('Erreur POST /bookings/check-in:', err.message);
-      res.status(500).json({ success: false, message: 'Erreur serveur' });
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+      }
     });
 });
 
@@ -403,7 +417,11 @@ router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(re
 //
 // @body {Array} items - [{ payload?, ref?, scanned_at? }]
 // @returns {Array} results - [{ ref, ok, code?, message? }]
-router.post('/check-in-batch', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+router.post('/check-in-batch', auth.authMiddleware, function(req, res) {
+  // TEAM-01 : on autorise scanner-only assistants en plus des owners.
+  // L'authorization par event est verifiee inline via userCanScanEvent
+  // dans processOne (pas besoin de role=organisateur global).
+  req.user = { id: req.userId };
   var items = Array.isArray(req.body.items) ? req.body.items : [];
   if (items.length === 0) {
     return res.status(400).json({ success: false, message: 'items vide' });
@@ -428,18 +446,7 @@ router.post('/check-in-batch', auth.authMiddleware, auth.requireOrganizer, funct
       return Promise.resolve({ ref: item.ref || null, ok: false, code: 'INVALID_REF', message: 'Ref invalide' });
     }
 
-    return pool.query(
-      'SELECT b.id, b.statut, b.utilise_at, e.organizer_id ' +
-      'FROM bookings b JOIN events e ON b.event_id = e.id WHERE b.ref = $1',
-      [ref]
-    ).then(function(result) {
-      if (result.rows.length === 0) {
-        return { ref: ref, ok: false, code: 'NOT_FOUND', message: 'Billet introuvable' };
-      }
-      var b = result.rows[0];
-      if (b.organizer_id !== req.user.id) {
-        return { ref: ref, ok: false, code: 'NOT_YOUR_EVENT', message: 'Pas ton evenement' };
-      }
+    function processStatus(b) {
       if (b.statut === 'utilise') {
         // Idempotent : deja scanne, pas une erreur dans le contexte batch.
         return { ref: ref, ok: true, code: 'ALREADY_USED', utilise_at: b.utilise_at };
@@ -462,6 +469,24 @@ router.post('/check-in-batch', auth.authMiddleware, auth.requireOrganizer, funct
           return { ref: ref, ok: true, code: 'ALREADY_USED' };
         }
         return { ref: ref, ok: true, utilise_at: upd.rows[0].utilise_at };
+      });
+    }
+
+    return pool.query(
+      'SELECT b.id, b.statut, b.utilise_at, b.event_id, e.organizer_id ' +
+      'FROM bookings b JOIN events e ON b.event_id = e.id WHERE b.ref = $1',
+      [ref]
+    ).then(function(result) {
+      if (result.rows.length === 0) {
+        return { ref: ref, ok: false, code: 'NOT_FOUND', message: 'Billet introuvable' };
+      }
+      var b = result.rows[0];
+      // TEAM-01 : owner OR staff
+      return userCanScanEvent(req.user.id, b.event_id).then(function(allowed) {
+        if (!allowed) {
+          return { ref: ref, ok: false, code: 'NOT_YOUR_EVENT', message: 'Pas autorise a scanner cet event' };
+        }
+        return processStatus(b);
       });
     }).catch(function(err) {
       console.error('Erreur batch item', ref, err.message);
@@ -488,7 +513,10 @@ router.post('/check-in-batch', auth.authMiddleware, auth.requireOrganizer, funct
 //   les events de l'orga)
 // @body {string} phone (peut etre partiel : "0707..." matchera "+2250707...")
 // @returns {Array} bookings - matchings avec statut + participant
-router.post('/lookup', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+router.post('/lookup', auth.authMiddleware, function(req, res) {
+  // TEAM-01 : autorise owner OU staff. Le filtre SQL ci-dessous limite au
+  // scope (events.organizer_id = me OR I'm in event_staff for that event).
+  req.user = { id: req.userId };
   var phone = (req.body.phone || '').trim();
   var eventId = req.body.event_id;
   if (phone.length < 4) {
@@ -504,13 +532,16 @@ router.post('/lookup', auth.authMiddleware, auth.requireOrganizer, function(req,
     return res.status(400).json({ success: false, message: 'Telephone invalide' });
   }
 
+  // Scope = events ou je suis owner OU staff. INNER JOIN sur la sous-requete
+  // permet ce filtre en un seul passage.
   var sql = 'SELECT b.id, b.ref, b.quantity, b.statut, b.utilise_at, b.created_at, ' +
     'b.event_id, e.title AS event_title, ' +
     'u.nom, u.prenom, u.phone ' +
     'FROM bookings b ' +
     'JOIN events e ON b.event_id = e.id ' +
     'JOIN users u ON b.user_id = u.id ' +
-    'WHERE e.organizer_id = $1 AND u.phone LIKE $2';
+    'WHERE u.phone LIKE $2 AND ' +
+    '(e.organizer_id = $1 OR EXISTS (SELECT 1 FROM event_staff s WHERE s.event_id = e.id AND s.user_id = $1))';
   var params = [req.user.id, '%' + suffix];
   if (eventId) {
     sql += ' AND b.event_id = $3';
