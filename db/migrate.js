@@ -446,6 +446,25 @@ CREATE TABLE IF NOT EXISTS admin_digests (\n\
   created_at TIMESTAMP DEFAULT NOW()\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_admin_digests_date ON admin_digests(digest_date DESC);\n\
+\n\
+-- ============================================================\n\
+-- ADM-NOTES : Notes internes polymorphiques (commentaires admin)\n\
+-- ============================================================\n\
+-- target_type = 'user' | 'event' | 'payment' | 'payout'\n\
+-- target_id = string (id stocké en VARCHAR pour homogénéité, FK soft)\n\
+-- Pas de FK dure car polymorphique. ON DELETE des rows cible doit être géré\n\
+-- ailleurs si on veut un cleanup auto (acceptable de laisser orphelin pour l'audit).\n\
+CREATE TABLE IF NOT EXISTS admin_notes (\n\
+  id SERIAL PRIMARY KEY,\n\
+  author_id INTEGER NOT NULL REFERENCES users(id),\n\
+  target_type VARCHAR(20) NOT NULL,\n\
+  target_id VARCHAR(50) NOT NULL,\n\
+  body TEXT NOT NULL,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  updated_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_admin_notes_target ON admin_notes(target_type, target_id, created_at DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_admin_notes_author ON admin_notes(author_id, created_at DESC);\n\
 ";
 
 console.log('Migration en cours...');

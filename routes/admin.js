@@ -1697,6 +1697,121 @@ router.patch('/users/:id/payout-account', function(req, res) {
 });
 
 // ============================================================
+// ADM-NOTES : Notes internes polymorphiques
+// ============================================================
+// 4 target_types autorisés : user, event, payment, payout. Whitelist côté
+// API pour éviter d'écrire n'importe quoi via JSON forgé.
+
+var ALLOWED_NOTE_TARGETS = ['user', 'event', 'payment', 'payout'];
+
+// GET /admin/notes?target_type=X&target_id=Y — Liste des notes sur une entité.
+router.get('/notes', function(req, res) {
+  var targetType = req.query.target_type;
+  var targetId = req.query.target_id;
+  if (!targetType || !targetId) {
+    return res.status(400).json({ success: false, message: 'target_type et target_id requis' });
+  }
+  if (ALLOWED_NOTE_TARGETS.indexOf(targetType) === -1) {
+    return res.status(400).json({ success: false, message: 'target_type invalide' });
+  }
+
+  pool.query(
+    'SELECT n.id, n.author_id, ' +
+    "u.prenom || ' ' || u.nom AS author_name, u.email AS author_email, " +
+    'n.body, n.created_at, n.updated_at ' +
+    'FROM admin_notes n JOIN users u ON u.id = n.author_id ' +
+    'WHERE n.target_type = $1 AND n.target_id = $2 ' +
+    'ORDER BY n.created_at DESC',
+    [targetType, targetId]
+  )
+    .then(function(r) {
+      res.json({
+        success: true,
+        notes: r.rows.map(function(n) {
+          return {
+            id: n.id.toString(),
+            author: { id: n.author_id.toString(), name: n.author_name, email: n.author_email },
+            body: n.body,
+            created_at: n.created_at,
+            updated_at: n.updated_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/notes:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /admin/notes — Crée une note.
+// @body {string} target_type, target_id, body
+router.post('/notes', function(req, res) {
+  var targetType = req.body.target_type;
+  var targetId = String(req.body.target_id || '');
+  var body = (req.body.body || '').trim();
+  if (!targetType || !targetId || !body) {
+    return res.status(400).json({ success: false, message: 'target_type, target_id, body requis' });
+  }
+  if (ALLOWED_NOTE_TARGETS.indexOf(targetType) === -1) {
+    return res.status(400).json({ success: false, message: 'target_type invalide' });
+  }
+  if (body.length > 5000) {
+    return res.status(400).json({ success: false, message: 'Note trop longue (5000 chars max)' });
+  }
+
+  pool.query(
+    'INSERT INTO admin_notes (author_id, target_type, target_id, body) ' +
+    'VALUES ($1, $2, $3, $4) RETURNING id, created_at',
+    [req.admin.id, targetType, targetId, body]
+  )
+    .then(function(r) {
+      logAudit(req.admin.id, 'note.create', targetType, targetId, { note_id: r.rows[0].id });
+      res.status(201).json({
+        success: true,
+        note: {
+          id: r.rows[0].id.toString(),
+          created_at: r.rows[0].created_at,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/notes:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// DELETE /admin/notes/:id — Supprime une note. L'auteur peut toujours
+// supprimer sa propre note. Un autre admin ne peut pas (audit trail).
+// V2 : super_admin pourra forcer la suppression de toute note.
+router.delete('/notes/:id', function(req, res) {
+  pool.query('SELECT author_id, target_type, target_id FROM admin_notes WHERE id = $1', [req.params.id])
+    .then(function(r) {
+      if (r.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Note non trouvée' });
+      }
+      var note = r.rows[0];
+      if (note.author_id !== req.admin.id) {
+        return res.status(403).json({
+          success: false,
+          message: 'Seul l\'auteur peut supprimer sa note',
+        });
+      }
+      return pool.query('DELETE FROM admin_notes WHERE id = $1', [req.params.id])
+        .then(function() {
+          logAudit(req.admin.id, 'note.delete', note.target_type, note.target_id, {
+            note_id: parseInt(req.params.id),
+          });
+          res.json({ success: true });
+        });
+    })
+    .catch(function(err) {
+      console.error('Erreur DELETE /admin/notes/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-BULK : Actions en masse (modération events + suspension users)
 // ============================================================
 // Limite hard 100 items par batch pour éviter timeout Render + UPDATE qui
