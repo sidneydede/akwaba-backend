@@ -1696,4 +1696,113 @@ router.patch('/users/:id/payout-account', function(req, res) {
     });
 });
 
+// ============================================================
+// ADM-AUDIT : Journal d'audit (lecture)
+// ============================================================
+// La table admin_audit_log se remplit automatiquement via logAudit() à chaque
+// action admin sensible. Ces routes exposent la lecture en lecture seule.
+
+// GET /admin/audit-log — Journal paginé avec filtres.
+// @query {string} admin_id - filtrer par admin
+// @query {string} action - préfixe LIKE (ex: 'event.', 'payout.')
+// @query {string} target_type - 'event' | 'user' | 'payment' | 'payout' | 'banner' | etc.
+// @query {string} from, to - bornes ISO date sur created_at
+// @query {number} page, page_size
+router.get('/audit-log', function(req, res) {
+  var pag = readPagination(req);
+  var clauses = [];
+  var params = [];
+
+  if (req.query.admin_id) {
+    params.push(parseInt(req.query.admin_id));
+    clauses.push('al.admin_id = $' + params.length);
+  }
+  if (req.query.action) {
+    params.push(req.query.action + '%');
+    clauses.push('al.action LIKE $' + params.length);
+  }
+  if (req.query.target_type) {
+    params.push(req.query.target_type);
+    clauses.push('al.target_type = $' + params.length);
+  }
+  if (req.query.from) {
+    params.push(req.query.from);
+    clauses.push('al.created_at >= $' + params.length);
+  }
+  if (req.query.to) {
+    params.push(req.query.to);
+    clauses.push('al.created_at <= $' + params.length);
+  }
+
+  var where = clauses.length > 0 ? ' WHERE ' + clauses.join(' AND ') : '';
+
+  var listSql =
+    'SELECT al.id, al.admin_id, ' +
+    "u.prenom || ' ' || u.nom AS admin_name, u.email AS admin_email, " +
+    'al.action, al.target_type, al.target_id, al.metadata, al.created_at ' +
+    'FROM admin_audit_log al ' +
+    'LEFT JOIN users u ON u.id = al.admin_id' + where +
+    ' ORDER BY al.created_at DESC LIMIT ' + pag.pageSize + ' OFFSET ' + pag.offset;
+
+  var countSql = 'SELECT COUNT(*)::int AS n FROM admin_audit_log al' + where;
+
+  Promise.all([pool.query(listSql, params), pool.query(countSql, params)])
+    .then(function(results) {
+      res.json({
+        success: true,
+        page: pag.page,
+        page_size: pag.pageSize,
+        total: results[1].rows[0].n,
+        entries: results[0].rows.map(function(r) {
+          return {
+            id: r.id.toString(),
+            admin: r.admin_id ? {
+              id: r.admin_id.toString(),
+              name: r.admin_name,
+              email: r.admin_email,
+            } : null,
+            action: r.action,
+            target_type: r.target_type,
+            target_id: r.target_id,
+            metadata: r.metadata,
+            created_at: r.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/audit-log:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// GET /admin/audit-log/facets — Listes pour les dropdowns de filtre UI :
+// actions distinctes, target_types distincts, admins ayant déjà loggé.
+router.get('/audit-log/facets', function(req, res) {
+  Promise.all([
+    pool.query('SELECT DISTINCT action FROM admin_audit_log ORDER BY action ASC'),
+    pool.query("SELECT DISTINCT target_type FROM admin_audit_log WHERE target_type IS NOT NULL ORDER BY target_type ASC"),
+    pool.query(
+      'SELECT DISTINCT al.admin_id, ' +
+      "u.prenom || ' ' || u.nom AS admin_name, u.email " +
+      'FROM admin_audit_log al LEFT JOIN users u ON u.id = al.admin_id ' +
+      'WHERE al.admin_id IS NOT NULL ORDER BY admin_name ASC'
+    ),
+  ])
+    .then(function(r) {
+      res.json({
+        success: true,
+        actions: r[0].rows.map(function(x) { return x.action; }),
+        target_types: r[1].rows.map(function(x) { return x.target_type; }),
+        admins: r[2].rows.map(function(x) {
+          return { id: x.admin_id.toString(), name: x.admin_name, email: x.email };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/audit-log/facets:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 module.exports = router;
