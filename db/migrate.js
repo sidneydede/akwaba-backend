@@ -277,6 +277,15 @@ CREATE TABLE IF NOT EXISTS favorites (\n\
 \n\
 CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id, created_at DESC);\n\
 CREATE INDEX IF NOT EXISTS idx_favorites_event ON favorites(event_id);\n\
+\n\
+-- ============================================================\n\
+-- PROFILE-01 : Champs profil étendus (ville, date naissance, photo)\n\
+-- ============================================================\n\
+-- Saisis lors de l'étape ProfilSetup (onboarding 03/03) côté front.\n\
+-- Tous optionnels (l'user peut skip).\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ville VARCHAR(120);\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS date_naissance DATE;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;\n\
 ";
 
 console.log('Migration en cours...');

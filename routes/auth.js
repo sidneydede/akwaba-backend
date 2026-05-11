@@ -249,7 +249,8 @@ router.post('/verify-otp', function(req, res) {
 // GET /auth/me — Récupère le profil de l'utilisateur connecté
 router.get('/me', auth.authMiddleware, function(req, res) {
   pool.query(
-    'SELECT id, nom, prenom, phone, role, preferences, created_at FROM users WHERE id = $1',
+    'SELECT id, nom, prenom, phone, role, preferences, ville, date_naissance, photo_url, ' +
+    'created_at FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -274,6 +275,9 @@ router.get('/me', auth.authMiddleware, function(req, res) {
               phone: user.phone,
               role: user.role,
               preferences: user.preferences || {},
+              ville: user.ville,
+              date_naissance: user.date_naissance,
+              photo_url: user.photo_url,
               created_at: user.created_at
             },
             stats: {
@@ -290,11 +294,13 @@ router.get('/me', auth.authMiddleware, function(req, res) {
 });
 
 // PATCH /auth/me — Met à jour le profil de l'utilisateur connecté.
-// Champs autorisés : prenom, nom. Le téléphone n'est PAS modifiable ici
-// (nominatif → nécessite re-OTP, à traiter dans un endpoint dédié). Le role
+// Champs autorisés :
+//   - prenom, nom : 1 à 50 caractères
+//   - ville : trim, max 120 caractères (PROFILE-01)
+//   - date_naissance : ISO YYYY-MM-DD, doit être < aujourd'hui ET > il y a 100 ans
+//   - photo_url : URL Cloudinary (anti-injection : doit pointer sur res.cloudinary.com du tenant)
+// Le téléphone n'est PAS modifiable ici (nominatif → nécessite re-OTP). Le role
 // et l'id ne sont jamais modifiables par l'utilisateur lui-même.
-// @body {string} [prenom] - 1 à 50 caractères
-// @body {string} [nom]    - 1 à 50 caractères
 router.patch('/me', auth.authMiddleware, function(req, res) {
   var input = req.body || {};
   var sets = [];
@@ -325,10 +331,87 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
     values.push(n);
   }
 
+  if (input.ville !== undefined) {
+    // null = effacer la ville. String = set/update.
+    if (input.ville === null) {
+      sets.push('ville = NULL');
+    } else {
+      var v = String(input.ville).trim();
+      if (v.length > 120) {
+        return res.status(400).json({
+          success: false,
+          message: 'Ville invalide (max 120 caractères).'
+        });
+      }
+      sets.push('ville = $' + i++);
+      values.push(v);
+    }
+  }
+
+  if (input.date_naissance !== undefined) {
+    if (input.date_naissance === null) {
+      sets.push('date_naissance = NULL');
+    } else {
+      // Format attendu : YYYY-MM-DD (regex strict pour eviter les surprises Postgres)
+      var dob = String(input.date_naissance).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Date de naissance invalide (format attendu : YYYY-MM-DD).'
+        });
+      }
+      var d = new Date(dob);
+      if (isNaN(d.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: 'Date de naissance invalide.'
+        });
+      }
+      var now = new Date();
+      var maxAgo = new Date();
+      maxAgo.setFullYear(maxAgo.getFullYear() - 100);
+      if (d.getTime() >= now.getTime() || d.getTime() < maxAgo.getTime()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Date de naissance hors plage (entre il y a 100 ans et hier).'
+        });
+      }
+      sets.push('date_naissance = $' + i++);
+      values.push(dob);
+    }
+  }
+
+  if (input.photo_url !== undefined) {
+    if (input.photo_url === null) {
+      sets.push('photo_url = NULL');
+    } else {
+      // Validation : doit etre une URL Cloudinary du tenant configure (anti-injection
+      // contre stockage d'URLs externes arbitraires). Format Cloudinary :
+      //   https://res.cloudinary.com/<cloud_name>/image/upload/...
+      var photo = String(input.photo_url).trim();
+      var cloudName = process.env.CLOUDINARY_CLOUD_NAME || '';
+      var allowedPrefix = 'https://res.cloudinary.com/' + cloudName + '/';
+      if (!cloudName || photo.indexOf(allowedPrefix) !== 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'URL photo invalide (doit être une URL Cloudinary du tenant Akwaba).'
+        });
+      }
+      if (photo.length > 500) {
+        return res.status(400).json({
+          success: false,
+          message: 'URL photo trop longue.'
+        });
+      }
+      sets.push('photo_url = $' + i++);
+      values.push(photo);
+    }
+  }
+
   if (sets.length === 0) {
     return res.status(400).json({
       success: false,
-      message: 'Aucun champ à mettre à jour (prenom et/ou nom requis).'
+      message: 'Aucun champ à mettre à jour.'
     });
   }
 
@@ -337,7 +420,7 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
 
   pool.query(
     'UPDATE users SET ' + sets.join(', ') + ' WHERE id = $' + i +
-    ' RETURNING id, nom, prenom, phone, role, preferences, created_at',
+    ' RETURNING id, nom, prenom, phone, role, preferences, ville, date_naissance, photo_url, created_at',
     values
   )
     .then(function(result) {
@@ -354,6 +437,9 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
           phone: user.phone,
           role: user.role,
           preferences: user.preferences || {},
+          ville: user.ville,
+          date_naissance: user.date_naissance,
+          photo_url: user.photo_url,
           created_at: user.created_at
         }
       });
@@ -362,6 +448,46 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
       console.error('Erreur PATCH /auth/me:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
+});
+
+// POST /auth/me/photo-signature — Génère une signature Cloudinary pour upload
+// direct de la photo de profil utilisateur depuis l'app mobile.
+// Mirror de POST /events/upload-signature (cf. routes/events.js) mais avec
+// folder dédié avatars/<user_id> + transformation auto crop sur visage (g_face).
+// Auth requise (n'importe quel user, pas juste orga).
+router.post('/me/photo-signature', auth.authMiddleware, function(req, res) {
+  var crypto = require('crypto');
+  var apiKey = process.env.CLOUDINARY_API_KEY;
+  var apiSecret = process.env.CLOUDINARY_API_SECRET;
+  var cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+
+  if (!apiKey || !apiSecret || !cloudName) {
+    return res.status(503).json({
+      success: false,
+      message: 'Cloudinary non configuré côté serveur',
+    });
+  }
+
+  // Folder dédié par user pour faciliter cleanup futur (DELETE user → DELETE photos).
+  var folder = 'akwaba/avatars/' + req.userId;
+  var timestamp = Math.floor(Date.now() / 1000);
+  // Transformation : crop carré 400x400 centré sur le visage si détecté, fallback
+  // sur center crop. Réduit l'usage bandwidth + uniformise les avatars dans l'UI.
+  var transformation = 'c_thumb,g_face,w_400,h_400';
+  // Les params signés doivent être triés alphabétiquement (cf. doc Cloudinary).
+  var paramsToSign = 'folder=' + folder + '&timestamp=' + timestamp + '&transformation=' + transformation;
+  var signature = crypto.createHash('sha1').update(paramsToSign + apiSecret).digest('hex');
+
+  res.json({
+    success: true,
+    signature: signature,
+    timestamp: timestamp,
+    transformation: transformation,
+    api_key: apiKey,
+    cloud_name: cloudName,
+    folder: folder,
+    upload_url: 'https://api.cloudinary.com/v1_1/' + cloudName + '/image/upload',
+  });
 });
 
 // PATCH /auth/me/preferences — Met à jour les préférences de l'utilisateur connecté.
