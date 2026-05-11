@@ -1697,6 +1697,98 @@ router.patch('/users/:id/payout-account', function(req, res) {
 });
 
 // ============================================================
+// ADM-SEARCH : Recherche globale Cmd+K
+// ============================================================
+// Recherche en parallèle dans 4 tables (users / events / bookings / payments).
+// Top 5 par catégorie, ordonné par created_at DESC pour ramener les résultats
+// récents en premier. LIKE % insensible à la casse sauf pour les refs/transac
+// (qui sont normalisées en UPPER).
+
+// GET /admin/search?q=
+// @query {string} q - texte de recherche (min 2 chars sinon empty arrays)
+router.get('/search', function(req, res) {
+  var q = (req.query.q || '').trim();
+  if (q.length < 2) {
+    return res.json({
+      success: true,
+      users: [], events: [], bookings: [], payments: [],
+    });
+  }
+  var like = '%' + q + '%';
+  var likeUpper = '%' + q.toUpperCase() + '%';
+
+  Promise.all([
+    pool.query(
+      'SELECT id, nom, prenom, phone, email, role ' +
+      'FROM users ' +
+      "WHERE LOWER(nom) LIKE LOWER($1) OR LOWER(prenom) LIKE LOWER($1) " +
+      "OR phone LIKE $1 OR LOWER(COALESCE(email, '')) LIKE LOWER($1) " +
+      'ORDER BY created_at DESC LIMIT 5',
+      [like]
+    ),
+    pool.query(
+      'SELECT id, title, status, date, category ' +
+      'FROM events WHERE LOWER(title) LIKE LOWER($1) ' +
+      'ORDER BY created_at DESC LIMIT 5',
+      [like]
+    ),
+    pool.query(
+      'SELECT b.id, b.ref, b.statut, b.total_amount, b.created_at, ' +
+      'u.nom AS user_nom, u.prenom AS user_prenom, ' +
+      'e.title AS event_title ' +
+      'FROM bookings b ' +
+      'LEFT JOIN users u ON u.id = b.user_id ' +
+      'LEFT JOIN events e ON e.id = b.event_id ' +
+      'WHERE UPPER(b.ref) LIKE $1 OR b.transaction_id LIKE $2 ' +
+      'ORDER BY b.created_at DESC LIMIT 5',
+      [likeUpper, like]
+    ),
+    pool.query(
+      'SELECT id, transaction_id, amount, currency, status, method ' +
+      'FROM payments WHERE transaction_id LIKE $1 ' +
+      'ORDER BY created_at DESC LIMIT 5',
+      [like]
+    ),
+  ])
+    .then(function(results) {
+      res.json({
+        success: true,
+        users: results[0].rows.map(function(u) {
+          return {
+            id: u.id.toString(),
+            nom: u.nom, prenom: u.prenom, phone: u.phone, email: u.email, role: u.role,
+          };
+        }),
+        events: results[1].rows.map(function(e) {
+          return {
+            id: e.id.toString(),
+            title: e.title, status: e.status, date: e.date, category: e.category,
+          };
+        }),
+        bookings: results[2].rows.map(function(b) {
+          return {
+            id: b.id.toString(),
+            ref: b.ref, statut: b.statut, total_amount: b.total_amount,
+            user_nom: b.user_nom, user_prenom: b.user_prenom,
+            event_title: b.event_title,
+          };
+        }),
+        payments: results[3].rows.map(function(p) {
+          return {
+            id: p.id.toString(),
+            transaction_id: p.transaction_id, amount: p.amount, currency: p.currency,
+            status: p.status, method: p.method,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/search:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-AUDIT : Journal d'audit (lecture)
 // ============================================================
 // La table admin_audit_log se remplit automatiquement via logAudit() à chaque
