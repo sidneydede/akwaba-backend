@@ -392,6 +392,155 @@ router.post('/check-in', auth.authMiddleware, auth.requireOrganizer, function(re
     });
 });
 
+// POST /bookings/check-in-batch — Sync de scans offline (SCAN-OFFLINE-01).
+// Le scanner mobile peut accumuler des scans en local quand le reseau est
+// down (typique en salle des fetes CI). Cet endpoint ingere le batch et
+// retourne un statut par item pour que le client puisse purger sa queue.
+//
+// Pour chaque item, applique la meme logique que /check-in (ownership +
+// statut + UPDATE conditionnel). Idempotent : un ref deja 'utilise' par
+// le meme orga renvoie ok=true (deja gere) plutot qu'erreur.
+//
+// @body {Array} items - [{ payload?, ref?, scanned_at? }]
+// @returns {Array} results - [{ ref, ok, code?, message? }]
+router.post('/check-in-batch', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var items = Array.isArray(req.body.items) ? req.body.items : [];
+  if (items.length === 0) {
+    return res.status(400).json({ success: false, message: 'items vide' });
+  }
+  if (items.length > 200) {
+    return res.status(400).json({ success: false, message: 'batch limite a 200 items' });
+  }
+
+  // Helper : traite un seul item, retourne une promesse resolue avec
+  // { ref, ok, code, message }. Pas de reject (les erreurs sont des items).
+  function processOne(item) {
+    var ref;
+    if (item.payload) {
+      var verified = qr.parseAndVerify(item.payload);
+      if (!verified.ok) {
+        return Promise.resolve({ ref: null, ok: false, code: 'INVALID_SIGNATURE', message: 'QR falsifie' });
+      }
+      ref = verified.ref;
+    } else if (item.ref && /^AKW-[A-F0-9]{8}$/.test(item.ref)) {
+      ref = item.ref;
+    } else {
+      return Promise.resolve({ ref: item.ref || null, ok: false, code: 'INVALID_REF', message: 'Ref invalide' });
+    }
+
+    return pool.query(
+      'SELECT b.id, b.statut, b.utilise_at, e.organizer_id ' +
+      'FROM bookings b JOIN events e ON b.event_id = e.id WHERE b.ref = $1',
+      [ref]
+    ).then(function(result) {
+      if (result.rows.length === 0) {
+        return { ref: ref, ok: false, code: 'NOT_FOUND', message: 'Billet introuvable' };
+      }
+      var b = result.rows[0];
+      if (b.organizer_id !== req.user.id) {
+        return { ref: ref, ok: false, code: 'NOT_YOUR_EVENT', message: 'Pas ton evenement' };
+      }
+      if (b.statut === 'utilise') {
+        // Idempotent : deja scanne, pas une erreur dans le contexte batch.
+        return { ref: ref, ok: true, code: 'ALREADY_USED', utilise_at: b.utilise_at };
+      }
+      if (b.statut === 'annule') {
+        return { ref: ref, ok: false, code: 'CANCELLED', message: 'Billet annule' };
+      }
+      if (b.statut !== 'confirme') {
+        return { ref: ref, ok: false, code: 'INVALID_STATUS', message: 'Statut: ' + b.statut };
+      }
+      var scannedAt = item.scanned_at && !isNaN(new Date(item.scanned_at).getTime())
+        ? new Date(item.scanned_at)
+        : new Date();
+      return pool.query(
+        "UPDATE bookings SET statut = 'utilise', utilise_at = $2, checkin_by = $3 " +
+        "WHERE id = $1 AND statut = 'confirme' RETURNING utilise_at",
+        [b.id, scannedAt, req.user.id]
+      ).then(function(upd) {
+        if (upd.rowCount === 0) {
+          return { ref: ref, ok: true, code: 'ALREADY_USED' };
+        }
+        return { ref: ref, ok: true, utilise_at: upd.rows[0].utilise_at };
+      });
+    }).catch(function(err) {
+      console.error('Erreur batch item', ref, err.message);
+      return { ref: ref, ok: false, code: 'SERVER_ERROR', message: 'Erreur serveur' };
+    });
+  }
+
+  Promise.all(items.map(processOne))
+    .then(function(results) {
+      res.json({ success: true, results: results });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /bookings/check-in-batch:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// POST /bookings/lookup — Recherche manuelle d'un billet par telephone
+// (SCAN-LOOKUP-01). Cas d'usage : QR illisible, telephone du participant
+// casse, billet papier degrade. L'orga tape le numero, on retourne les
+// billets correspondants pour ses events. Utile quand le scan visuel echoue.
+//
+// @body {number|string} event_id (optionnel — si absent, cherche dans tous
+//   les events de l'orga)
+// @body {string} phone (peut etre partiel : "0707..." matchera "+2250707...")
+// @returns {Array} bookings - matchings avec statut + participant
+router.post('/lookup', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var phone = (req.body.phone || '').trim();
+  var eventId = req.body.event_id;
+  if (phone.length < 4) {
+    return res.status(400).json({ success: false, message: 'Telephone trop court (min 4 chiffres)' });
+  }
+  // Normalise pour matching ILIKE : supprime espaces et caracteres non-numeriques
+  // sauf le +. Permet de matcher "07 07..." vs "+2250707...".
+  var normalized = phone.replace(/[^0-9+]/g, '');
+  // On utilise un suffix matching : les phones backend sont stockes avec +225
+  // prefix typiquement. L'orga peut taper juste les 8-10 derniers digits.
+  var suffix = normalized.replace(/^\+?225/, '').slice(-10);
+  if (suffix.length < 4) {
+    return res.status(400).json({ success: false, message: 'Telephone invalide' });
+  }
+
+  var sql = 'SELECT b.id, b.ref, b.quantity, b.statut, b.utilise_at, b.created_at, ' +
+    'b.event_id, e.title AS event_title, ' +
+    'u.nom, u.prenom, u.phone ' +
+    'FROM bookings b ' +
+    'JOIN events e ON b.event_id = e.id ' +
+    'JOIN users u ON b.user_id = u.id ' +
+    'WHERE e.organizer_id = $1 AND u.phone LIKE $2';
+  var params = [req.user.id, '%' + suffix];
+  if (eventId) {
+    sql += ' AND b.event_id = $3';
+    params.push(eventId);
+  }
+  sql += ' ORDER BY b.created_at DESC LIMIT 20';
+
+  pool.query(sql, params)
+    .then(function(result) {
+      var bookings = result.rows.map(function(r) {
+        return {
+          id: r.id,
+          ref: r.ref,
+          quantity: r.quantity,
+          statut: r.statut,
+          utilise_at: r.utilise_at,
+          created_at: r.created_at,
+          event_id: r.event_id.toString(),
+          event_title: r.event_title,
+          participant: { nom: r.nom, prenom: r.prenom, phone: r.phone },
+        };
+      });
+      res.json({ success: true, bookings: bookings });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /bookings/lookup:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // POST /bookings/:id/cancel — Annulation par l'utilisateur (BK-04).
 // Politique de remboursement (lue depuis app_settings.refund_policy_default) :
 //   - >48h avant l'événement → 100%
