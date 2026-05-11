@@ -15,6 +15,33 @@ function generateOtp() {
   return n.toString();
 }
 
+// REF-01 : génère un referral_code unique au format AKW-XXXX (4 chars base36).
+// ~1.6M codes possibles, retry si collision UNIQUE (rare). Crypto-random pour
+// éviter la prédictibilité (un attaquant pourrait sinon deviner les codes parrain).
+// @returns {Promise<string>}
+function generateUniqueReferralCode() {
+  var crypto = require('crypto');
+  function tryOnce(attemptsLeft) {
+    if (attemptsLeft <= 0) {
+      return Promise.reject(new Error('referral_code generation failed after retries'));
+    }
+    // 4 chars base36 = 36^4 = 1,679,616 codes. Suffisant pour V1 (~10K users max).
+    // Si on grandit, passer à 5 ou 6 chars.
+    var bytes = crypto.randomBytes(3);
+    var n = (bytes[0] << 16) | (bytes[1] << 8) | bytes[2];
+    var suffix = n.toString(36).toUpperCase().padStart(4, '0').slice(-4);
+    var code = 'AKW-' + suffix;
+    return pool.query('SELECT 1 FROM users WHERE referral_code = $1', [code])
+      .then(function(check) {
+        if (check.rows.length > 0) {
+          return tryOnce(attemptsLeft - 1);
+        }
+        return code;
+      });
+  }
+  return tryOnce(5);
+}
+
 // Calcule la date d'expiration OTP. Plus strict pour orga (compromission = accès aux fonds).
 // @param {string} role - 'participant' | 'organisateur' | 'admin'
 // @returns {Date}
@@ -78,20 +105,30 @@ router.post('/register', function(req, res) {
         });
       }
 
-      return pool.query(
-        'INSERT INTO users (nom, prenom, phone, role) VALUES ($1, $2, $3, $4) RETURNING id, phone, role',
-        [nom, prenom, phone, role]
-      )
-        .then(function(insertResult) {
-          var user = insertResult.rows[0];
-          return issueOtp(user).then(function(extra) {
-            res.status(201).json(Object.assign({
-              success: true,
-              message: 'Compte créé. Un code de vérification vous a été envoyé par SMS.',
-              phone: user.phone,
-              next: 'verify-otp'
-            }, extra));
-          });
+      // REF-01 : genere un referral_code unique pour le nouveau user (5 retries
+      // contre collision UNIQUE). Si echoue, le user est cree quand meme avec
+      // referral_code NULL — un job de backfill peut rattraper plus tard.
+      return generateUniqueReferralCode()
+        .catch(function(err) {
+          console.warn('register: referral_code generation failed', err.message);
+          return null;
+        })
+        .then(function(referralCode) {
+          return pool.query(
+            'INSERT INTO users (nom, prenom, phone, role, referral_code) VALUES ($1, $2, $3, $4, $5) RETURNING id, phone, role',
+            [nom, prenom, phone, role, referralCode]
+          )
+            .then(function(insertResult) {
+              var user = insertResult.rows[0];
+              return issueOtp(user).then(function(extra) {
+                res.status(201).json(Object.assign({
+                  success: true,
+                  message: 'Compte créé. Un code de vérification vous a été envoyé par SMS.',
+                  phone: user.phone,
+                  next: 'verify-otp'
+                }, extra));
+              });
+            });
         });
     })
     .catch(function(err) {
@@ -250,7 +287,7 @@ router.post('/verify-otp', function(req, res) {
 router.get('/me', auth.authMiddleware, function(req, res) {
   pool.query(
     'SELECT id, nom, prenom, phone, role, preferences, ville, date_naissance, photo_url, ' +
-    'created_at FROM users WHERE id = $1',
+    'referral_code, points, created_at FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -278,6 +315,8 @@ router.get('/me', auth.authMiddleware, function(req, res) {
               ville: user.ville,
               date_naissance: user.date_naissance,
               photo_url: user.photo_url,
+              referral_code: user.referral_code,
+              points: user.points || 0,
               created_at: user.created_at
             },
             stats: {

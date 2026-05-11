@@ -305,6 +305,38 @@ CREATE TABLE IF NOT EXISTS feedback (\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_feedback_event ON feedback(event_id);\n\
 CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at DESC);\n\
+\n\
+-- ============================================================\n\
+-- REF-01 : Programme de parrainage\n\
+-- ============================================================\n\
+-- Chaque user a un referral_code unique (genere a register, backfill pour existants).\n\
+-- Quand un filleul redeem un code, on cree un referral pending. Quand le filleul\n\
+-- fait sa 1ere reservation confirmee (hook webhook /payments/notify), on award\n\
+-- 200 pts au parrain + push notif. Le filleul a deja recu 500 pts au redeem.\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code VARCHAR(12) UNIQUE;\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0;\n\
+\n\
+-- Backfill : tous les users existants recoivent un code AKW-XXXX deterministe\n\
+-- (hash de id+created_at en base36, premiers 4 chars uppercase).\n\
+UPDATE users SET referral_code = 'AKW-' || UPPER(SUBSTRING(MD5(id::text || COALESCE(created_at::text, NOW()::text)) FROM 1 FOR 4))\n\
+WHERE referral_code IS NULL;\n\
+\n\
+CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code);\n\
+\n\
+CREATE TABLE IF NOT EXISTS referrals (\n\
+  id SERIAL PRIMARY KEY,\n\
+  parrain_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  filleul_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'confirmed')),\n\
+  points_filleul INTEGER NOT NULL DEFAULT 500,\n\
+  points_parrain INTEGER NOT NULL DEFAULT 200,\n\
+  parrain_points_awarded BOOLEAN NOT NULL DEFAULT false,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  confirmed_at TIMESTAMP,\n\
+  UNIQUE (filleul_id),\n\
+  CHECK (parrain_id != filleul_id)\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_referrals_parrain ON referrals(parrain_id);\n\
 ";
 
 console.log('Migration en cours...');

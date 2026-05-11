@@ -34,6 +34,60 @@ function notifyBookingConfirmed(bookingId) {
     .catch(function(err) { console.error('Erreur notifyBookingConfirmed (webhook):', err.message); });
 }
 
+// REF-01 : Si l'user qui vient de booking_confirmed a un referral pending et
+// que le bonus parrain n'a pas encore ete delivre, on award 200 pts au parrain
+// + push notif. Idempotent : la condition parrain_points_awarded = false +
+// status = 'pending' s'execute UNE fois (UPDATE atomique).
+//
+// Appele apres notifyBookingConfirmed dans le webhook /payments/notify.
+// Best effort : log les erreurs mais ne throw jamais (booking confirme reste OK).
+function awardReferralBonusIfEligible(bookingId) {
+  pool.query(
+    'SELECT b.user_id, u.prenom AS filleul_prenom FROM bookings b ' +
+    'JOIN users u ON u.id = b.user_id WHERE b.id = $1',
+    [bookingId]
+  )
+    .then(function(bookingResult) {
+      if (bookingResult.rows.length === 0) return;
+      var filleulId = bookingResult.rows[0].user_id;
+      var filleulPrenom = bookingResult.rows[0].filleul_prenom;
+
+      // UPDATE atomique : marque le referral confirmed + retourne parrain_id et points si eligible.
+      // Si pas de row affecte (pas de referral pending OU deja awarded), pas de side-effect.
+      return pool.query(
+        'UPDATE referrals SET status = \'confirmed\', parrain_points_awarded = true, ' +
+        'confirmed_at = NOW() ' +
+        'WHERE filleul_id = $1 AND status = \'pending\' AND parrain_points_awarded = false ' +
+        'RETURNING parrain_id, points_parrain',
+        [filleulId]
+      ).then(function(refResult) {
+        if (refResult.rows.length === 0) return; // Pas eligible (pas de referral, ou deja award)
+        var parrainId = refResult.rows[0].parrain_id;
+        var pointsParrain = refResult.rows[0].points_parrain;
+
+        // Award points au parrain
+        return pool.query(
+          'UPDATE users SET points = COALESCE(points, 0) + $1 WHERE id = $2',
+          [pointsParrain, parrainId]
+        ).then(function() {
+          // Push notif au parrain
+          push.notifyUser(parrainId, {
+            title: '🎁 Bonus parrainage',
+            body: filleulPrenom + ' vient de réserver son 1er événement ! Tu as gagné ' + pointsParrain + ' pts.',
+            data: {
+              type: 'referral_confirmed',
+              filleul_prenom: filleulPrenom,
+              points: pointsParrain,
+            }
+          });
+        });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur awardReferralBonusIfEligible:', err.message);
+    });
+}
+
 // POST /payments/notify — Webhook CinetPay
 // Sécurité (deux couches) :
 //   1. Vérification HMAC du header x-token (signature partagée avec CinetPay).
@@ -91,7 +145,11 @@ router.post('/notify', function(req, res) {
             [transactionId]
           )
             .then(function(updateResult) {
-              updateResult.rows.forEach(function(row) { notifyBookingConfirmed(row.id); });
+              updateResult.rows.forEach(function(row) {
+                notifyBookingConfirmed(row.id);
+                // REF-01 : check si l'user a un referral pending → award bonus parrain
+                awardReferralBonusIfEligible(row.id);
+              });
               res.json({
                 success: true,
                 message: 'Paiement vérifié et réservation confirmée',
