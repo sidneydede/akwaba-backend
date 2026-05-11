@@ -613,6 +613,35 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_campaign VARCHAR(80);\n\
 -- manuel via /admin/fraud/alerts (section transaction_reuse).\n\
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_transaction_id_unique\n\
   ON bookings(transaction_id) WHERE transaction_id IS NOT NULL;\n\
+\n\
+-- ============================================================\n\
+-- SEC-H2 : OTP hash (scrypt) au lieu du code en clair\n\
+-- ============================================================\n\
+-- Avant : otp_code VARCHAR(6) stocké en clair → DB leak = tous les OTP\n\
+-- actifs (5 min de fenêtre) compromis.\n\
+-- Après : otp_hash 'scrypt:<salt>:<derived>' (même format que password_hash).\n\
+-- Pas de migration data : les OTP émis avant la mise à jour expirent\n\
+-- naturellement en 5 min, après quoi seuls les nouveaux otp_hash sont utilisés.\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_hash TEXT;\n\
+\n\
+-- ============================================================\n\
+-- SEC-H4 : Audit log côté participant (traçabilité actions sensibles)\n\
+-- ============================================================\n\
+-- Inscrit chaque action sensible : login OTP, profile update, refund\n\
+-- request, booking cancel, etc. Visible au user via GET /auth/me/activity\n\
+-- (transparence RGPD) et utilisable pour incident response.\n\
+-- Retention 365 jours via jobs/data-retention.js.\n\
+CREATE TABLE IF NOT EXISTS user_audit_log (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  action VARCHAR(40) NOT NULL,\n\
+  ip VARCHAR(45),\n\
+  user_agent VARCHAR(300),\n\
+  metadata JSONB,\n\
+  created_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_user_audit_user ON user_audit_log(user_id, created_at DESC);\n\
+CREATE INDEX IF NOT EXISTS idx_user_audit_action ON user_audit_log(action, created_at DESC);\n\
 ";
 
 console.log('Migration en cours...');

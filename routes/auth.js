@@ -6,6 +6,7 @@ var router = express.Router();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var sms = require('../services/sms');
+var userAudit = require('../services/userAudit');
 
 // Génère un code OTP à 6 chiffres (crypto-random, pas Math.random qui est prédictible).
 // @returns {string}
@@ -64,11 +65,17 @@ function otpLimits(role) {
 function issueOtp(user) {
   var code = generateOtp();
   var expires = otpExpiry(user.role);
-  return pool.query(
-    'UPDATE users SET otp_code = $1, otp_expires_at = $2, otp_attempts = 0, ' +
-    'otp_locked_until = NULL, updated_at = NOW() WHERE id = $3',
-    [code, expires, user.id]
-  )
+  // SEC H2 : hash le code avant store (scrypt, same format que password_hash).
+  // En DB on stocke uniquement otp_hash. otp_code legacy nettoyé.
+  return auth.hashPassword(code)
+    .then(function(hash) {
+      return pool.query(
+        'UPDATE users SET otp_hash = $1, otp_code = NULL, ' +
+        'otp_expires_at = $2, otp_attempts = 0, otp_locked_until = NULL, ' +
+        'updated_at = NOW() WHERE id = $3',
+        [hash, expires, user.id]
+      );
+    })
     .then(function() {
       return sms.sendOtp(user.phone, code);
     })
@@ -76,6 +83,14 @@ function issueOtp(user) {
       // En mode dev, on renvoie l'OTP au client pour faciliter les tests
       if (smsResult.dev) {
         return { dev_otp: code };
+      }
+      // Mode prod : si AT a rejeté le SMS, propager l'erreur au lieu de
+      // mentir au client. register/login regardent sms_error pour renvoyer
+      // un 502 explicite. Permet de diagnostiquer (sandbox non whitelisté,
+      // sender ID non approuvé, solde épuisé, etc.) sans accès aux logs Render.
+      if (smsResult.success === false) {
+        console.error('[issueOtp] SMS rejected by AT for', user.phone, ':', JSON.stringify(smsResult.error));
+        return { sms_error: smsResult.error };
       }
       return {};
     });
@@ -121,6 +136,15 @@ router.post('/register', function(req, res) {
             .then(function(insertResult) {
               var user = insertResult.rows[0];
               return issueOtp(user).then(function(extra) {
+                if (extra.sms_error) {
+                  return res.status(502).json({
+                    success: false,
+                    code: 'SMS_DELIVERY_FAILED',
+                    message: 'Compte créé mais le SMS n\'a pas pu être envoyé. Réessaye via /auth/request-otp.',
+                    phone: user.phone,
+                    sms_error: extra.sms_error
+                  });
+                }
                 res.status(201).json(Object.assign({
                   success: true,
                   message: 'Compte créé. Un code de vérification vous a été envoyé par SMS.',
@@ -157,6 +181,15 @@ router.post('/login', function(req, res) {
 
       var user = result.rows[0];
       return issueOtp(user).then(function(extra) {
+        if (extra.sms_error) {
+          return res.status(502).json({
+            success: false,
+            code: 'SMS_DELIVERY_FAILED',
+            message: 'Le SMS n\'a pas pu être envoyé. Vérifie le numéro ou réessaie plus tard.',
+            phone: user.phone,
+            sms_error: extra.sms_error
+          });
+        }
         res.json(Object.assign({
           success: true,
           message: 'Code de vérification envoyé par SMS',
@@ -191,7 +224,7 @@ router.post('/verify-otp', function(req, res) {
   }
 
   pool.query(
-    'SELECT id, nom, prenom, phone, role, otp_code, otp_expires_at, otp_attempts, otp_locked_until ' +
+    'SELECT id, nom, prenom, phone, role, otp_hash, otp_expires_at, otp_attempts, otp_locked_until ' +
     'FROM users WHERE phone = $1',
     [phone]
   )
@@ -213,7 +246,7 @@ router.post('/verify-otp', function(req, res) {
         });
       }
 
-      if (!user.otp_code) {
+      if (!user.otp_hash) {
         return res.status(400).json({
           success: false,
           message: 'Aucun code en attente. Demandez un nouveau code.'
@@ -227,58 +260,101 @@ router.post('/verify-otp', function(req, res) {
         });
       }
 
-      if (user.otp_code !== code) {
-        // Incrémente attempts + verrouille si dépassement.
-        var newAttempts = (user.otp_attempts || 0) + 1;
-        if (newAttempts >= limits.maxAttempts) {
-          var lockUntil = new Date(Date.now() + limits.lockoutMinutes * 60 * 1000);
-          return pool.query(
-            'UPDATE users SET otp_attempts = $1, otp_locked_until = $2, ' +
-            'otp_code = NULL, otp_expires_at = NULL WHERE id = $3',
-            [newAttempts, lockUntil, user.id]
-          ).then(function() {
-            res.status(429).json({
-              success: false,
-              code: 'LOCKED',
-              message: 'Trop de tentatives. Compte temporairement verrouillé pendant ' +
-                limits.lockoutMinutes + ' minutes.'
+      // SEC H2 : verify via scrypt (timing-safe). Plus de comparaison en clair.
+      return auth.verifyPassword(code, user.otp_hash).then(function(matched) {
+        if (!matched) {
+          // Incrémente attempts + verrouille si dépassement.
+          var newAttempts = (user.otp_attempts || 0) + 1;
+          if (newAttempts >= limits.maxAttempts) {
+            var lockUntil = new Date(Date.now() + limits.lockoutMinutes * 60 * 1000);
+            return pool.query(
+              'UPDATE users SET otp_attempts = $1, otp_locked_until = $2, ' +
+              'otp_hash = NULL, otp_expires_at = NULL WHERE id = $3',
+              [newAttempts, lockUntil, user.id]
+            ).then(function() {
+              res.status(429).json({
+                success: false,
+                code: 'LOCKED',
+                message: 'Trop de tentatives. Compte temporairement verrouillé pendant ' +
+                  limits.lockoutMinutes + ' minutes.'
+              });
             });
-          });
+          }
+          return pool.query('UPDATE users SET otp_attempts = $1 WHERE id = $2', [newAttempts, user.id])
+            .then(function() {
+              res.status(400).json({
+                success: false,
+                message: 'Code incorrect',
+                attempts_left: limits.maxAttempts - newAttempts
+              });
+            });
         }
-        return pool.query('UPDATE users SET otp_attempts = $1 WHERE id = $2', [newAttempts, user.id])
-          .then(function() {
-            res.status(400).json({
-              success: false,
-              message: 'Code incorrect',
-              attempts_left: limits.maxAttempts - newAttempts
-            });
-          });
-      }
 
-      // OK : on efface l'OTP, on reset les compteurs, et on retourne le token
-      return pool.query(
-        'UPDATE users SET otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, ' +
-        'otp_locked_until = NULL, last_login_at = NOW(), updated_at = NOW() WHERE id = $1',
-        [user.id]
-      )
-        .then(function() {
-          var token = auth.generateToken(user.id);
-          res.json({
-            success: true,
-            message: 'Connexion réussie',
-            user: {
-              id: user.id.toString(),
-              nom: user.nom,
-              prenom: user.prenom,
-              phone: user.phone,
-              role: user.role
-            },
-            token: token
-          });
-        });
+        // Code valide — continue avec le flow de génération du token (ci-dessous).
+        return acceptOtp(user, req, res);
+      });
     })
     .catch(function(err) {
-      console.error('Erreur verify-otp:', err.message);
+      console.error('Erreur POST /auth/verify-otp:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// Helper extrait : OTP validé, on émet le token + cleanup OTP + compteurs.
+// Séparé pour rendre le flow verify-otp lisible après le refactor scrypt.
+function acceptOtp(user, req, res) {
+  return pool.query(
+    'UPDATE users SET otp_hash = NULL, otp_code = NULL, otp_expires_at = NULL, ' +
+    'otp_attempts = 0, otp_locked_until = NULL, last_login_at = NOW(), ' +
+    'updated_at = NOW() WHERE id = $1',
+    [user.id]
+  )
+    .then(function() {
+      var token = auth.generateToken(user.id);
+      // SEC H4 : trace login dans user_audit_log (fire-and-forget).
+      userAudit.log(user.id, userAudit.ACTIONS.LOGIN, req, { phone: user.phone });
+      res.json({
+        success: true,
+        message: 'Connexion réussie',
+        user: {
+          id: user.id.toString(),
+          nom: user.nom,
+          prenom: user.prenom,
+          phone: user.phone,
+          role: user.role,
+        },
+        token: token,
+      });
+    });
+}
+
+// GET /auth/me/activity — Le user voit son propre historique d'activité.
+// Limité 100 entrées (recent first). Transparence RGPD article 15 :
+// l'user a le droit de voir les données qu'on stocke à son sujet.
+router.get('/me/activity', auth.authMiddleware, function(req, res) {
+  pool.query(
+    'SELECT id, action, ip, user_agent, metadata, created_at ' +
+    'FROM user_audit_log WHERE user_id = $1 ' +
+    'ORDER BY created_at DESC LIMIT 100',
+    [req.userId]
+  )
+    .then(function(r) {
+      res.json({
+        success: true,
+        activity: r.rows.map(function(row) {
+          return {
+            id: row.id.toString(),
+            action: row.action,
+            ip: row.ip,
+            user_agent: row.user_agent,
+            metadata: row.metadata,
+            created_at: row.created_at,
+          };
+        }),
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /auth/me/activity:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
@@ -467,6 +543,11 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
         return res.status(404).json({ success: false, message: 'Utilisateur introuvable' });
       }
       var user = result.rows[0];
+      // SEC H4 : trace l'update profile. metadata = liste des champs modifiés
+      // (sans les valeurs sensibles).
+      userAudit.log(req.userId, userAudit.ACTIONS.PROFILE_UPDATE, req, {
+        fields: Object.keys(input || {}),
+      });
       res.json({
         success: true,
         user: {

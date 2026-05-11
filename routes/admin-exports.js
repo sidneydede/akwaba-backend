@@ -11,6 +11,21 @@ var auth = require('../middleware/auth');
 // Whitelist des tables exportables avec leur SQL pré-construit (joints inclus
 // pour rendre les exports lisibles sans avoir à recouper avec d'autres tables).
 // $1 = from, $2 = to (exclusive), $3 = LIMIT.
+// SEC NEW-1 : RBAC fine sur exports PII. Chaque table déclare quels rôles
+// peuvent l'exporter en plus de super_admin (qui peut tout). Les tables
+// contenant du PII sensible (users, payments, payouts, feedback NPS privé)
+// sont réservées à finance. Les tables "publiques" (events, reviews) sont
+// open au moderator.
+var TABLE_ROLES = {
+  users: ['finance'],                    // PII : phone, email, ville, date naissance, photo
+  bookings: ['finance'],                 // PII : couple user + event + amount
+  payments: ['finance'],                 // Financier
+  payouts: ['finance'],                  // Financier
+  feedback: ['finance'],                 // NPS privé (commentaires user, sensible)
+  events: ['moderator', 'finance'],      // Catalogue, semi-public
+  reviews: ['moderator', 'finance'],     // Avis publics (déjà visibles côté mobile)
+};
+
 var TABLES = {
   users: {
     label: 'Utilisateurs',
@@ -172,6 +187,18 @@ router.get('/:table', function(req, res) {
     return res.status(400).json({
       success: false,
       message: 'Table inconnue. Disponibles: ' + Object.keys(TABLES).join(', '),
+    });
+  }
+
+  // SEC NEW-1 : RBAC enforcement. super_admin a accès tout, sinon le rôle
+  // doit être dans la whitelist de la table.
+  var allowedRoles = TABLE_ROLES[tableName] || [];
+  var userRole = req.admin.admin_role;
+  if (userRole !== 'super_admin' && allowedRoles.indexOf(userRole) === -1) {
+    return res.status(403).json({
+      success: false,
+      message: 'Export "' + tableName + '" réservé à : super_admin' +
+        (allowedRoles.length > 0 ? ', ' + allowedRoles.join(', ') : ''),
     });
   }
 

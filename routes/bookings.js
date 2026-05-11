@@ -9,6 +9,7 @@ var auth = require('../middleware/auth');
 var push = require('../services/push');
 var qr = require('../services/qr');
 var cinetpay = require('../services/cinetpay');
+var userAudit = require('../services/userAudit');
 var waitlistRouter = require('./waitlist');
 
 // Envoie les notifications "billet confirmé" au participant et à l'organisateur.
@@ -64,6 +65,16 @@ router.post('/', auth.authMiddleware, function(req, res) {
     return res.status(400).json({
       success: false,
       message: 'eventId est obligatoire'
+    });
+  }
+
+  // SEC H8 : bornes quantity [1, 10]. parseInt(-5) === -5 → total_amount
+  // négatif → refund frauduleux possible si cancel auto. parseInt(1000) =
+  // achat massif suspect (anti-bot, anti-scalper).
+  if (quantity < 1 || quantity > 10) {
+    return res.status(400).json({
+      success: false,
+      message: 'quantity doit être entre 1 et 10 places.',
     });
   }
 
@@ -637,6 +648,13 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
         // L'admin verra le booking dans /refunds queue et marquera 'paid'
         // après virement manuel CinetPay.
         var initialRefundStatus = refundAmount > 0 ? 'pending' : 'skip';
+        // SEC H4 : trace l'annulation pour le user (transparence + incident response)
+        userAudit.log(req.userId, userAudit.ACTIONS.BOOKING_CANCEL, req, {
+          booking_id: bookingId,
+          event_title: b.title,
+          refund_amount: refundAmount,
+          refund_ratio: ratio,
+        });
         return pool.query(
           "UPDATE bookings SET statut = 'annule', cancelled_at = NOW(), " +
           'refund_amount = $1, refund_ratio = $2, cancellation_reason = $3, ' +

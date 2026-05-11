@@ -214,4 +214,12 @@ app.listen(PORT, function() {
     var adminDigest = require('./jobs/admin-digest');
     adminDigest.start();
   }
+
+  // Worker de rétention RGPD (SEC NEW-4). Tick toutes les 24h pour purger
+  // les données expirées : search_queries (90j), digests (180j), audit_log
+  // (365j). Désactivable via DISABLE_DATA_RETENTION=true.
+  if (process.env.DISABLE_DATA_RETENTION !== 'true') {
+    var dataRetention = require('./jobs/data-retention');
+    dataRetention.start();
+  }
 });

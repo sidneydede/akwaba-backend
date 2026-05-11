@@ -524,6 +524,19 @@ router.get('/events/:id', function(req, res) {
 // Retourne directement un document HTML formaté (Content-Type: text/html)
 // avec print CSS. Le front l'ouvre dans un nouvel onglet, l'admin fait
 // Cmd+P → Save as PDF pour générer le PDF natif navigateur (zéro lib).
+//
+// SEC NEW-6 : escape les user-content (title, lieu, organizer nom/prenom)
+// avant concat HTML. Sans ça, un orga qui met son nom à <script>...</script>
+// injecte du XSS dans tous les admins qui ouvrent la facture.
+var escapeHtml = function(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+};
 router.get('/events/:id/invoice', function(req, res) {
   Promise.all([
     pool.query(
@@ -567,7 +580,7 @@ router.get('/events/:id/invoice', function(req, res) {
       res.set('Content-Type', 'text/html; charset=utf-8');
       res.send(
         '<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">' +
-        '<title>Facture commission ' + invoiceNumber + '</title>' +
+        '<title>Facture commission ' + escapeHtml(invoiceNumber) + '</title>' +
         '<style>' +
         '@page { size: A4; margin: 24mm 20mm; }' +
         'body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; ' +
@@ -589,18 +602,18 @@ router.get('/events/:id/invoice', function(req, res) {
         '  <div class="brand">Akwaba <span class="accent">Admin</span></div>' +
         '  <div class="meta">' +
         '    <strong>Facture commission</strong><br>' +
-        '    N° ' + invoiceNumber + '<br>' +
-        '    Émise le ' + invoiceDate +
+        '    N° ' + escapeHtml(invoiceNumber) + '<br>' +
+        '    Émise le ' + escapeHtml(invoiceDate) +
         '  </div>' +
         '</div>' +
         '<h2>Organisateur</h2>' +
-        '<div class="row"><span>Nom</span><span>' + (e.organizer_prenom || '') + ' ' + (e.organizer_nom || '') + '</span></div>' +
-        '<div class="row"><span>Téléphone</span><span>' + (e.organizer_phone || '—') + '</span></div>' +
-        (e.organizer_email ? '<div class="row"><span>Email</span><span>' + e.organizer_email + '</span></div>' : '') +
+        '<div class="row"><span>Nom</span><span>' + escapeHtml(e.organizer_prenom) + ' ' + escapeHtml(e.organizer_nom) + '</span></div>' +
+        '<div class="row"><span>Téléphone</span><span>' + escapeHtml(e.organizer_phone || '—') + '</span></div>' +
+        (e.organizer_email ? '<div class="row"><span>Email</span><span>' + escapeHtml(e.organizer_email) + '</span></div>' : '') +
         '<h2>Événement</h2>' +
-        '<div class="row"><span>Titre</span><span>' + e.title + '</span></div>' +
-        '<div class="row"><span>Lieu</span><span>' + e.lieu + '</span></div>' +
-        '<div class="row"><span>Date</span><span>' + e.date + '</span></div>' +
+        '<div class="row"><span>Titre</span><span>' + escapeHtml(e.title) + '</span></div>' +
+        '<div class="row"><span>Lieu</span><span>' + escapeHtml(e.lieu) + '</span></div>' +
+        '<div class="row"><span>Date</span><span>' + escapeHtml(e.date) + '</span></div>' +
         '<h2>Décompte financier</h2>' +
         '<div class="row"><span>Bookings confirmés</span><span>' + b.n + '</span></div>' +
         '<div class="row"><span>Annulations</span><span>' + b.cancelled_count + '</span></div>' +
@@ -3027,7 +3040,39 @@ router.patch('/refunds/:id', auth.requireAdminRole(['finance']), function(req, r
     });
   }
 
+  // SEC NEW-2 : valide refund_proof_url contre une whitelist de hosts.
+  // Anti-XSS persistante : sans ça, un admin malveillant peut injecter
+  // 'javascript:fetch(...)' ou un domaine externe pour exfiltrer cookies
+  // d'autres admins.
   var proofUrl = req.body.refund_proof_url || null;
+  if (proofUrl !== null) {
+    proofUrl = String(proofUrl).trim();
+    if (proofUrl === '') {
+      proofUrl = null;
+    } else {
+      var cloudName = process.env.CLOUDINARY_CLOUD_NAME || '';
+      var cloudinaryPrefix = cloudName ? 'https://res.cloudinary.com/' + cloudName + '/' : null;
+      var allowedHosts = [
+        cloudinaryPrefix,
+        'https://akwaba.ci/',
+        'https://akwaba.app/',
+        'https://akwaba-backend.onrender.com/',
+      ].filter(Boolean);
+      var ok = allowedHosts.some(function(prefix) { return proofUrl.indexOf(prefix) === 0; });
+      if (!ok) {
+        return res.status(400).json({
+          success: false,
+          message: 'refund_proof_url doit pointer sur Cloudinary ou un domaine Akwaba.',
+        });
+      }
+      if (proofUrl.length > 500) {
+        return res.status(400).json({
+          success: false,
+          message: 'refund_proof_url trop longue.',
+        });
+      }
+    }
+  }
   var notes = req.body.refund_notes || null;
   // 'paid' → set paid_at + paid_by ; sinon clear paid info si revient en pending.
   var setPaidAt = newStatus === 'paid' ? 'NOW()' : 'NULL';
@@ -3225,6 +3270,16 @@ router.get('/finance', function(req, res) {
 
 var ALLOWED_NOTE_TARGETS = ['user', 'event', 'payment', 'payout'];
 
+// SEC NEW-5 : cloisonnement écriture de notes par target_type × rôle. Un
+// support n'a pas vocation à écrire sur payment/payout (pas son domaine).
+// super_admin implicitement autorisé sur tout.
+var NOTE_WRITE_PERMS = {
+  user: ['moderator', 'finance', 'support'],
+  event: ['moderator'],
+  payment: ['finance'],
+  payout: ['finance'],
+};
+
 // GET /admin/notes?target_type=X&target_id=Y — Liste des notes sur une entité.
 router.get('/notes', function(req, res) {
   var targetType = req.query.target_type;
@@ -3279,6 +3334,18 @@ router.post('/notes', function(req, res) {
   }
   if (body.length > 5000) {
     return res.status(400).json({ success: false, message: 'Note trop longue (5000 chars max)' });
+  }
+
+  // SEC NEW-5 : enforce role × target_type.
+  var role = req.admin.admin_role;
+  var allowed = NOTE_WRITE_PERMS[targetType] || [];
+  if (role !== 'super_admin' && allowed.indexOf(role) === -1) {
+    return res.status(403).json({
+      success: false,
+      message: 'Ton rôle (' + (role || 'aucun') + ') ne peut pas écrire de notes sur "' +
+        targetType + '". Requis : super_admin' +
+        (allowed.length > 0 ? ', ' + allowed.join(', ') : ''),
+    });
   }
 
   pool.query(
