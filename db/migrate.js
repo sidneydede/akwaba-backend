@@ -286,6 +286,25 @@ CREATE INDEX IF NOT EXISTS idx_favorites_event ON favorites(event_id);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ville VARCHAR(120);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS date_naissance DATE;\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT;\n\
+\n\
+-- ============================================================\n\
+-- FEEDBACK-01 : NPS post-event (signal qualité interne)\n\
+-- ============================================================\n\
+-- Différent des reviews publics : feedback = interne (ratings + commentaires\n\
+-- privés pour l'équipe Akwaba), reviews = social proof public sur la fiche event.\n\
+-- 1 feedback max par user par booking (UNIQUE).\n\
+CREATE TABLE IF NOT EXISTS feedback (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  booking_id INTEGER NOT NULL REFERENCES bookings(id) ON DELETE CASCADE,\n\
+  event_id INTEGER REFERENCES events(id) ON DELETE SET NULL,\n\
+  rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),\n\
+  comment TEXT,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  UNIQUE (user_id, booking_id)\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_feedback_event ON feedback(event_id);\n\
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at DESC);\n\
 ";
 
 console.log('Migration en cours...');
