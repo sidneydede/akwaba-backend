@@ -30,6 +30,7 @@ var feedbackRoutes = require('./routes/feedback');
 var referralsRoutes = require('./routes/referrals');
 var followsRoutes = require('./routes/follows');
 var reviewsRoutes = require('./routes/reviews');
+var waitlistRoutes = require('./routes/waitlist');
 
 var app = express();
 var PORT = process.env.PORT || 3000;
@@ -105,6 +106,7 @@ app.use('/follows', followsRoutes);
 // Reviews : path nested sous /events/:eventId — le router utilise mergeParams: true
 // pour acceder a req.params.eventId.
 app.use('/events/:eventId/reviews', reviewsRoutes);
+app.use('/waitlist', waitlistRoutes);
 
 // Sentry error handler — DOIT être après toutes les routes mais avant
 // les autres middlewares de gestion d'erreur. Capture toute exception non gérée.

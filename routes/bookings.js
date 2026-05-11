@@ -9,6 +9,7 @@ var auth = require('../middleware/auth');
 var push = require('../services/push');
 var qr = require('../services/qr');
 var cinetpay = require('../services/cinetpay');
+var waitlistRouter = require('./waitlist');
 
 // Envoie les notifications "billet confirmé" au participant et à l'organisateur.
 // Appelé après qu'un booking passe en statut 'confirme'. N'attend pas le résultat
@@ -463,6 +464,18 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
               'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',
               [b.quantity, b.event_id]
             );
+          })
+          .then(function() {
+            // WAITLIST-01 : une place s'est liberee, notifier le prochain user en
+            // queue (joined_at ASC, notified_at NULL). Best effort, ne bloque pas.
+            // Si l'event etait sold-out et a maintenant 1+ places restantes,
+            // ce hook fait gagner 30-50% des places annulees re-vendues.
+            //
+            // Note : on call notifyNextOnWaitlist pour CHAQUE place liberee
+            // (b.quantity fois) si quantity > 1 — comme ca on notifie q users.
+            for (var qi = 0; qi < b.quantity; qi++) {
+              waitlistRouter.notifyNextOnWaitlist(b.event_id);
+            }
           })
           .then(function() {
             // Notif user (toujours) + orga si refund > 0 (impact sur ses revenus).

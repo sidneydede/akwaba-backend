@@ -374,6 +374,25 @@ CREATE TABLE IF NOT EXISTS reviews (\n\
   UNIQUE (user_id, event_id)\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_reviews_event ON reviews(event_id, created_at DESC);\n\
+\n\
+-- ============================================================\n\
+-- WAITLIST-01 : Liste d'attente sur events sold-out\n\
+-- ============================================================\n\
+-- Quand places_restantes = 0, l'user peut rejoindre la waitlist. Quand un\n\
+-- booking est annule (POST /bookings/:id/cancel), un hook notifie le 1er\n\
+-- user en waitlist (par joined_at ASC) qu'une place s'est liberee. notified_at\n\
+-- est marque pour ne pas re-notifier le meme user. Si l'user rejoint plus\n\
+-- tard, il revient en queue avec notified_at = NULL.\n\
+CREATE TABLE IF NOT EXISTS waitlists (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,\n\
+  joined_at TIMESTAMP DEFAULT NOW(),\n\
+  notified_at TIMESTAMP,\n\
+  UNIQUE (user_id, event_id)\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_waitlists_event_queue ON waitlists(event_id, joined_at ASC);\n\
+CREATE INDEX IF NOT EXISTS idx_waitlists_user ON waitlists(user_id);\n\
 ";
 
 console.log('Migration en cours...');
