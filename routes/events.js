@@ -40,24 +40,29 @@ router.get('/', function(req, res) {
       '))))';
   }
 
-  var selectCols = 'id, title, description, category, date, lieu, prix, prix_display, ' +
-    'emoji, color, chaud, image_url, places_total, places_restantes, latitude, longitude';
+  // FOLLOW-01 : LEFT JOIN sur users pour exposer organisateur_id/prenom/nom au front
+  // (utilisé par la card "Organisé par X" + bouton Suivre dans EventScreen).
+  // LEFT JOIN car certains events legacy peuvent avoir organizer_id NULL.
+  var selectCols = 'e.id, e.title, e.description, e.category, e.date, e.lieu, ' +
+    'e.prix, e.prix_display, e.emoji, e.color, e.chaud, e.image_url, ' +
+    'e.places_total, e.places_restantes, e.latitude, e.longitude, ' +
+    'u.id AS organisateur_id, u.prenom AS organisateur_prenom, u.nom AS organisateur_nom';
   if (hasGeo) selectCols += ', ' + distanceExpr + ' AS distance_km';
 
   var clauses = [];
   // Catalogue public : ne montre que les events validés par modération admin.
-  clauses.push("status = 'approved'");
-  if (hasDistanceFilter) clauses.push('latitude IS NOT NULL AND longitude IS NOT NULL');
+  clauses.push("e.status = 'approved'");
+  if (hasDistanceFilter) clauses.push('e.latitude IS NOT NULL AND e.longitude IS NOT NULL');
   if (category) {
     params.push(category);
-    clauses.push('LOWER(category) = LOWER($' + params.length + ')');
+    clauses.push('LOWER(e.category) = LOWER($' + params.length + ')');
   }
   if (search) {
     params.push('%' + search + '%');
-    clauses.push('(LOWER(title) LIKE LOWER($' + params.length + ') OR LOWER(lieu) LIKE LOWER($' + params.length + '))');
+    clauses.push('(LOWER(e.title) LIKE LOWER($' + params.length + ') OR LOWER(e.lieu) LIKE LOWER($' + params.length + '))');
   }
 
-  var sql = 'SELECT ' + selectCols + ' FROM events';
+  var sql = 'SELECT ' + selectCols + ' FROM events e LEFT JOIN users u ON u.id = e.organizer_id';
   if (clauses.length > 0) sql += ' WHERE ' + clauses.join(' AND ');
 
   if (hasDistanceFilter) {
@@ -65,7 +70,7 @@ router.get('/', function(req, res) {
     params.push(distanceKm);
     sql = 'SELECT * FROM (' + sql + ') sub WHERE distance_km <= $' + params.length + ' ORDER BY distance_km ASC';
   } else {
-    sql += ' ORDER BY chaud DESC, created_at DESC';
+    sql += ' ORDER BY e.chaud DESC, e.created_at DESC';
   }
 
   pool.query(sql, params)
@@ -87,7 +92,10 @@ router.get('/', function(req, res) {
           places_total: row.places_total,
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-          longitude: row.longitude !== null ? parseFloat(row.longitude) : null
+          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
+          organisateur_prenom: row.organisateur_prenom || null,
+          organisateur_nom: row.organisateur_nom || null,
         };
         if (row.distance_km !== undefined && row.distance_km !== null) {
           ev.distance_km = parseFloat(row.distance_km);
@@ -98,7 +106,7 @@ router.get('/', function(req, res) {
       res.json({ success: true, events: events });
     })
     .catch(function(err) {
-      console.error('Erreur GET /events:', err.message);
+      console.error('Erreur GET /events:', err.message, '\n  code:', err && err.code);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
@@ -116,10 +124,17 @@ router.get('/', function(req, res) {
 // événements similaires aux favoris, etc.
 router.get('/recommended', function(req, res) {
   // Auth optionnelle : lecture du token si présent, mais on accepte les anonymes.
+  // decodeToken retourne null si invalide (pas d'exception), donc safe.
+  // Wrapper try/catch supplémentaire au cas où une regression amenerait un throw.
   var userId = null;
-  var authHeader = req.headers.authorization;
-  if (authHeader && authHeader.indexOf('Bearer ') === 0) {
-    userId = auth.decodeToken(authHeader.replace('Bearer ', ''));
+  try {
+    var authHeader = req.headers.authorization;
+    if (authHeader && authHeader.indexOf('Bearer ') === 0) {
+      userId = auth.decodeToken(authHeader.replace('Bearer ', ''));
+    }
+  } catch (decodeErr) {
+    console.warn('GET /events/recommended : decodeToken throw (continuing as anonymous)', decodeErr.message);
+    userId = null;
   }
 
   var prefCategories = []; // partagé via closure entre les deux .then
@@ -141,9 +156,11 @@ router.get('/recommended', function(req, res) {
 
       // Popularity = nb de bookings actifs (confirmés ou déjà utilisés).
       // Sous-requête plutôt que JOIN/GROUP BY pour éviter les bookings sans event.
+      // FOLLOW-01 : ajout JOIN users pour exposer organisateur_id/prenom/nom au front.
       var selectCols = 'e.id, e.title, e.description, e.category, e.date, e.lieu, ' +
         'e.prix, e.prix_display, e.emoji, e.color, e.chaud, e.image_url, ' +
         'e.places_total, e.places_restantes, e.latitude, e.longitude, ' +
+        'u.id AS organisateur_id, u.prenom AS organisateur_prenom, u.nom AS organisateur_nom, ' +
         "(SELECT COUNT(*)::int FROM bookings b WHERE b.event_id = e.id " +
         "AND b.statut IN ('confirme', 'utilise')) AS popularity";
 
@@ -151,12 +168,14 @@ router.get('/recommended', function(req, res) {
       if (prefCategories.length > 0) {
         // Personnalisé : on filtre par les catégories préférées.
         sql = 'SELECT ' + selectCols + ' FROM events e ' +
+          'LEFT JOIN users u ON u.id = e.organizer_id ' +
           "WHERE e.status = 'approved' AND LOWER(e.category) = ANY($1::text[]) " +
           'ORDER BY e.chaud DESC, popularity DESC, e.created_at DESC LIMIT 20';
         params = [prefCategories.map(function(c) { return c.toLowerCase(); })];
       } else {
         // Anonyme ou sans préférences : top global.
         sql = 'SELECT ' + selectCols + ' FROM events e ' +
+          'LEFT JOIN users u ON u.id = e.organizer_id ' +
           "WHERE e.status = 'approved' " +
           'ORDER BY e.chaud DESC, popularity DESC, e.created_at DESC LIMIT 20';
         params = [];
@@ -183,6 +202,9 @@ router.get('/recommended', function(req, res) {
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
+          organisateur_prenom: row.organisateur_prenom || null,
+          organisateur_nom: row.organisateur_nom || null,
           popularity: row.popularity || 0,
         };
       });
@@ -193,7 +215,14 @@ router.get('/recommended', function(req, res) {
       });
     })
     .catch(function(err) {
-      console.error('Erreur GET /events/recommended:', err.message);
+      // Log verbose (message + stack + SQL state si Postgres) pour pouvoir diagnostiquer
+      // depuis les logs Render. Sentry capture aussi via setupExpressErrorHandler.
+      console.error(
+        'Erreur GET /events/recommended:',
+        err && err.message,
+        '\n  code:', err && err.code,
+        '\n  stack:', err && err.stack
+      );
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
@@ -360,9 +389,13 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
     });
 });
 
-// GET /events/:id — Détail d'un événement
+// GET /events/:id — Détail d'un événement (avec orga via LEFT JOIN, FOLLOW-01)
 router.get('/:id', function(req, res) {
-  pool.query('SELECT * FROM events WHERE id = $1', [req.params.id])
+  pool.query(
+    'SELECT e.*, u.id AS organisateur_id, u.prenom AS organisateur_prenom, u.nom AS organisateur_nom ' +
+    'FROM events e LEFT JOIN users u ON u.id = e.organizer_id WHERE e.id = $1',
+    [req.params.id]
+  )
     .then(function(result) {
       if (result.rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Événement non trouvé' });
@@ -388,7 +421,10 @@ router.get('/:id', function(req, res) {
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
-          organizer_id: row.organizer_id
+          organizer_id: row.organizer_id,
+          organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
+          organisateur_prenom: row.organisateur_prenom || null,
+          organisateur_nom: row.organisateur_nom || null,
         }
       });
     })
