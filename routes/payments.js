@@ -137,11 +137,14 @@ router.post('/notify', function(req, res) {
             return res.json({ success: true, message: 'Webhook enregistré, statut: ' + realStatus });
           }
 
-          // Paiement vraiment confirmé : on update le booking.
-          // On match par transaction_id (déjà rattaché lors de l'init paiement) ou ref.
+          // Paiement vraiment confirmé : on update le booking. Match STRICT
+          // sur transaction_id uniquement (le booking est rattaché à transac
+          // dès l'init paiement). Le match sur ref a été retiré (SEC-SPRINT0)
+          // car il permettait des cross-confirmations si transaction_id était
+          // accidentellement = à un ref booking d'un autre user.
           return pool.query(
-            "UPDATE bookings SET statut = 'confirme', transaction_id = $1, updated_at = NOW() " +
-            "WHERE (transaction_id = $1 OR ref = $1) AND statut != 'confirme' RETURNING id",
+            "UPDATE bookings SET statut = 'confirme', updated_at = NOW() " +
+            "WHERE transaction_id = $1 AND statut != 'confirme' RETURNING id",
             [transactionId]
           )
             .then(function(updateResult) {

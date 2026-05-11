@@ -11,7 +11,15 @@
 
 var crypto = require('crypto');
 
-var HMAC_SECRET = process.env.QR_HMAC_SECRET || process.env.TOKEN_SECRET || 'akwaba-qr-secret-dev';
+// QR_HMAC_SECRET dédié recommandé. Fallback sur TOKEN_SECRET si non défini.
+// Pas de fallback dev — TOKEN_SECRET est validé au boot dans middleware/auth.js,
+// donc on arrive ici avec une valeur garantie sûre.
+var HMAC_SECRET = process.env.QR_HMAC_SECRET || process.env.TOKEN_SECRET;
+if (!HMAC_SECRET) {
+  throw new Error(
+    'QR_HMAC_SECRET (ou TOKEN_SECRET) manquant. Configure-le dans .env / Render.'
+  );
+}
 var SIG_LENGTH = 16; // 16 hex chars = 64 bits — collision-resistant pour notre échelle.
 
 // Calcule la signature HMAC tronquée d'une ref booking.

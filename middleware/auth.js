@@ -4,21 +4,29 @@
 var crypto = require('crypto');
 var pool = require('../db/pool');
 
-// TOKEN_SECRET doit être défini en prod, sinon tous les tokens seraient forgeables.
-// Fail-fast au boot plutôt que silently fallback sur un secret connu.
+// TOKEN_SECRET doit être défini quelle que soit l'environnement (un fallback
+// dev publiquement connu = tous les tokens forgeables en dev/staging/CI).
+// Pour démarrer localement : ajoute TOKEN_SECRET=<32 bytes random hex> dans .env.
 var TOKEN_SECRET = process.env.TOKEN_SECRET;
 if (!TOKEN_SECRET) {
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error(
-      'TOKEN_SECRET manquant en production. Définis la variable d\'environnement avant de démarrer.'
-    );
-  }
-  TOKEN_SECRET = 'akwaba-secret-dev';
-  console.warn('[auth] TOKEN_SECRET absent — fallback dev utilisé. NE JAMAIS déployer comme ça.');
+  throw new Error(
+    'TOKEN_SECRET manquant. Génère un secret aléatoire (openssl rand -hex 32) et ' +
+    'définis-le dans .env (dev) ou dans les vars d\'environnement Render (prod).'
+  );
 }
 
 // Durée de vie courte pour les tokens admin (back-office sensible).
 var ADMIN_TOKEN_TTL_MS = 8 * 60 * 60 * 1000; // 8h
+
+// Durée de vie tokens mobile/participant. 30 jours = compromis sécurité/UX :
+// un user actif refait login mensuel (UX OK), un téléphone perdu n'expose pas
+// l'account ad vitam. Pour révocation immédiate, voir POST /auth/logout
+// (V2 : table user_token_version pour invalidation globale).
+var MOBILE_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 jours
+
+// Garde mémoire : un token volumineux est suspect et coûte du CPU à décoder
+// (Buffer.from base64 → string → split). Hard cap pour prévenir CPU DoS.
+var MAX_TOKEN_LENGTH = 500;
 
 // Durée du "challenge token" remis après la validation du password mais avant
 // la saisie du code TOTP. Court pour limiter une fenêtre d'attaque où ce token
@@ -72,17 +80,26 @@ function decodeToken(token, maxAgeMs) {
   }
 }
 
-// Middleware Express pour vérifier l'authentification
-// Ajoute req.userId si le token est valide
+// Middleware Express pour vérifier l'authentification.
+// Applique MOBILE_TOKEN_TTL_MS pour les tokens participant/orga (30 jours).
+// Sur 401 token expiré, le front mobile doit refaire login OTP.
 function authMiddleware(req, res, next) {
   var authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, message: 'Token manquant' });
   }
   var token = authHeader.replace('Bearer ', '');
-  var userId = decodeToken(token);
-  if (!userId) {
+  // CPU guard : un token > 500 chars est forcément forgé.
+  if (token.length > MAX_TOKEN_LENGTH) {
     return res.status(401).json({ success: false, message: 'Token invalide' });
+  }
+  var userId = decodeToken(token, MOBILE_TOKEN_TTL_MS);
+  if (!userId) {
+    return res.status(401).json({
+      success: false,
+      code: 'token_expired',
+      message: 'Session expirée, reconnecte-toi.',
+    });
   }
   req.userId = userId;
   next();
@@ -97,6 +114,9 @@ function adminAuthMiddleware(req, res, next) {
     return res.status(401).json({ success: false, message: 'Token manquant' });
   }
   var token = authHeader.replace('Bearer ', '');
+  if (token.length > MAX_TOKEN_LENGTH) {
+    return res.status(401).json({ success: false, message: 'Token invalide' });
+  }
   var userId = decodeToken(token, ADMIN_TOKEN_TTL_MS);
   if (!userId) {
     return res.status(401).json({
@@ -263,5 +283,6 @@ module.exports = {
   hashPassword: hashPassword,
   verifyPassword: verifyPassword,
   ADMIN_TOKEN_TTL_MS: ADMIN_TOKEN_TTL_MS,
-  CHALLENGE_TOKEN_TTL_MS: CHALLENGE_TOKEN_TTL_MS
+  MOBILE_TOKEN_TTL_MS: MOBILE_TOKEN_TTL_MS,
+  CHALLENGE_TOKEN_TTL_MS: CHALLENGE_TOKEN_TTL_MS,
 };

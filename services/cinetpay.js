@@ -8,6 +8,15 @@ var crypto = require('crypto');
 var CINETPAY_API_KEY = process.env.CINETPAY_API_KEY;
 var CINETPAY_SITE_ID = process.env.CINETPAY_SITE_ID;
 var CINETPAY_SECRET_KEY = process.env.CINETPAY_SECRET_KEY;
+
+// Sprint 0 security : fail-fast si SECRET_KEY absente en prod. Sinon le
+// verifyHmacToken renvoyait true (fail-OPEN) — un attaquant pouvait forger
+// des webhooks tant que le double-check API était down.
+if (process.env.NODE_ENV === 'production' && !CINETPAY_SECRET_KEY) {
+  throw new Error(
+    'CINETPAY_SECRET_KEY manquante en production. Configure la var sur Render avant de démarrer.'
+  );
+}
 var CINETPAY_INIT_URL = 'https://api-checkout.cinetpay.com/v2/payment';
 var CINETPAY_CHECK_URL = 'https://api-checkout.cinetpay.com/v2/payment/check';
 // URL de base de l'API backend (utilisée pour notify_url envoyée à CinetPay)
@@ -33,9 +42,12 @@ var transferTokenCache = { token: null, expiresAt: 0 };
 // @param {string} token - valeur du header x-token
 // @returns {boolean}
 function verifyHmacToken(body, token) {
+  // Fail-CLOSED : si pas de secret, on REFUSE le webhook (le boot a déjà
+  // refusé de démarrer en prod sans la var, donc on ne devrait jamais
+  // tomber ici en prod. En dev, ça force à configurer la var localement).
   if (!CINETPAY_SECRET_KEY) {
-    console.warn('CINETPAY_SECRET_KEY absent — skip HMAC, on s\'appuie sur le double-check API');
-    return true;
+    console.error('CINETPAY_SECRET_KEY absent — webhook REJECTED (fail-closed)');
+    return false;
   }
   if (!token) return false;
 

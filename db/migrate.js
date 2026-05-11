@@ -602,6 +602,17 @@ CREATE INDEX IF NOT EXISTS idx_search_queries_no_result ON search_queries(query_
 ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_source VARCHAR(40);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_medium VARCHAR(40);\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS acquisition_campaign VARCHAR(80);\n\
+\n\
+-- ============================================================\n\
+-- SEC-SPRINT0 : UNIQUE partial sur bookings.transaction_id\n\
+-- ============================================================\n\
+-- Empêche un transaction_id CinetPay d'être réutilisé sur plusieurs bookings\n\
+-- (sinon un webhook /payments/notify confirme N bookings d'un coup).\n\
+-- Partial : NULL autorisé pour les bookings pas encore payés.\n\
+-- Si la création échoue, c'est qu'il y a déjà des doublons en DB → cleanup\n\
+-- manuel via /admin/fraud/alerts (section transaction_reuse).\n\
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_transaction_id_unique\n\
+  ON bookings(transaction_id) WHERE transaction_id IS NOT NULL;\n\
 ";
 
 console.log('Migration en cours...');

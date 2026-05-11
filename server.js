@@ -17,6 +17,8 @@ if (process.env.SENTRY_DSN) {
 
 var express = require('express');
 var cors = require('cors');
+var helmet = require('helmet');
+var rateLimit = require('express-rate-limit');
 
 var authRoutes = require('./routes/auth');
 var eventsRoutes = require('./routes/events');
@@ -43,27 +45,50 @@ var PORT = process.env.PORT || 3000;
 // '1' = on fait confiance à un seul hop de proxy (suffisant pour Render).
 app.set('trust proxy', 1);
 
-// Middlewares
-// CORS : autorise l'app mobile (origin null sur Expo Go natif) + le site commercial
-// + la webapp orga. En dev on accepte aussi les ports Vite (5173/5174) et Expo web.
+// Sprint 0 security : headers HTTP + fingerprinting + body limit.
+app.disable('x-powered-by');
+app.use(helmet({
+  // Pas de CSP par défaut — on n'a pas de surface HTML statique (sauf
+  // /payment-success qui est inline et /admin/events/:id/invoice). Si on
+  // ajoute du HTML server-rendu plus tard, ajouter une CSP ici.
+  contentSecurityPolicy: false,
+  // crossOriginEmbedderPolicy bloque les iframes inter-origin → désactivé
+  // car CinetPay redirige dans une iframe.
+  crossOriginEmbedderPolicy: false,
+}));
+// Body JSON limité à 100 KB. Routes d'upload utilisent Cloudinary direct
+// upload (pas de transit par le backend) donc 100KB suffit largement pour
+// tout payload "normal" (formulaires, JSON métier).
+app.use(express.json({ limit: '100kb' }));
+
+// CORS strict en production. L'app mobile native envoie sans Origin (Expo Go
+// natif) → toujours autorisé. Les domaines web sont whitelistés. En dev
+// (NODE_ENV != 'production'), on accepte tout pour permettre ngrok/staging.
 app.use(cors({
   origin: function(origin, callback) {
     if (!origin) return callback(null, true);
     var allowed = [
       'https://akwaba.ci',
       'https://www.akwaba.ci',
+      'https://akwaba-admin.vercel.app',
+      'https://admin.akwaba.app',
+      'http://localhost:3000',
       'http://localhost:5173',
       'http://localhost:5174',
       'http://localhost:8081',
-      'http://localhost:19006'
+      'http://localhost:19006',
     ];
     if (allowed.indexOf(origin) !== -1) return callback(null, true);
-    // Tunnel ngrok/cloudflared utile pour tester scan QR mobile : on log et on accepte.
-    console.log('CORS origin non whitelistée mais acceptée:', origin);
-    callback(null, true);
-  }
+    // En dev : permissif (ngrok, cloudflared, staging Vercel preview…)
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('CORS (dev) accepté:', origin);
+      return callback(null, true);
+    }
+    // En prod : reject strict. Loggué dans Sentry via le error handler.
+    console.error('CORS bloqué (prod):', origin);
+    callback(new Error('CORS: origin non autorisée'));
+  },
 }));
-app.use(express.json());
 
 // Route santé
 app.get('/', function(req, res) {
@@ -97,6 +122,23 @@ app.get('/payment-success', function(req, res) {
     (transId ? '<code>Réf : ' + String(transId).replace(/[^A-Za-z0-9.-]/g, '') + '</code>' : '') +
     '</body></html>'
   );
+});
+
+// Sprint 0 security : rate-limit sur les endpoints auth (anti SMS-pumping +
+// anti brute force OTP). 5 req/min par IP est large pour un user humain
+// légitime, restrictif pour un script.
+var authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Trop de tentatives, réessaie dans 1 min.' },
+});
+// Sur /auth — applique à login, register, request-otp, verify-otp.
+// Skip pour les GET (rarissime sur /auth mais on évite de bloquer un /auth/me).
+app.use('/auth', function(req, res, next) {
+  if (req.method !== 'POST') return next();
+  return authLimiter(req, res, next);
 });
 
 // Routes API
