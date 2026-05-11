@@ -514,6 +514,16 @@ CREATE TABLE IF NOT EXISTS support_messages (\n\
   created_at TIMESTAMP DEFAULT NOW()\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_support_messages_ticket ON support_messages(ticket_id, created_at ASC);\n\
+\n\
+-- ============================================================\n\
+-- ADM-COMM-PER-EVENT : Taux de commission spécifique par event\n\
+-- ============================================================\n\
+-- NULL = utilise app_settings.commission_rate (défaut global 6%).\n\
+-- Valeur entre 0 et 1 = override pour cet event uniquement (négo orga VIP,\n\
+-- event caritatif 0%, partenariat spécial…). Validé côté API (0..1).\n\
+-- N'affecte que les futurs payouts — les payouts déjà créés gardent leur\n\
+-- commission_amount snapshotté.\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS commission_rate DECIMAL(4,3);\n\
 ";
 
 console.log('Migration en cours...');

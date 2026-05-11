@@ -467,7 +467,8 @@ router.get('/events/:id', function(req, res) {
   pool.query(
     'SELECT e.*, u.nom AS organizer_nom, u.prenom AS organizer_prenom, u.phone AS organizer_phone, ' +
     '(e.places_total - e.places_restantes) AS places_vendues, ' +
-    "COALESCE((SELECT SUM(total_amount) FROM bookings WHERE event_id = e.id AND statut = 'confirme'), 0)::bigint AS revenue " +
+    "COALESCE((SELECT SUM(total_amount) FROM bookings WHERE event_id = e.id AND statut = 'confirme'), 0)::bigint AS revenue, " +
+    "(SELECT (value::text)::numeric FROM app_settings WHERE key = 'commission_rate') AS global_commission_rate " +
     'FROM events e LEFT JOIN users u ON u.id = e.organizer_id WHERE e.id = $1',
     [req.params.id]
   )
@@ -501,6 +502,9 @@ router.get('/events/:id', function(req, res) {
           rejection_reason: row.rejection_reason,
           moderated_at: row.moderated_at,
           created_at: row.created_at,
+          commission_rate: row.commission_rate !== null ? parseFloat(row.commission_rate) : null,
+          global_commission_rate: row.global_commission_rate !== null
+            ? parseFloat(row.global_commission_rate) : 0.06,
           organizer: row.organizer_id ? {
             id: row.organizer_id.toString(),
             nom: row.organizer_nom,
@@ -512,6 +516,51 @@ router.get('/events/:id', function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur GET /admin/events/:id:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/events/:id/commission-rate — Override le taux de commission
+// d'un event. Body { commission_rate: number|null }. null = revient au défaut
+// global (app_settings.commission_rate). N'affecte que les futurs payouts.
+// Réservé finance + super_admin.
+router.patch('/events/:id/commission-rate', auth.requireAdminRole(['finance']), function(req, res) {
+  var rate = req.body.commission_rate;
+  if (rate !== null && rate !== undefined) {
+    if (typeof rate !== 'number' || rate < 0 || rate > 1) {
+      return res.status(400).json({
+        success: false,
+        message: 'commission_rate doit être entre 0 et 1 (ex: 0.06 pour 6%)',
+      });
+    }
+  } else {
+    rate = null;
+  }
+
+  pool.query(
+    'UPDATE events SET commission_rate = $1, updated_at = NOW() WHERE id = $2 ' +
+    'RETURNING id, title, commission_rate',
+    [rate, req.params.id]
+  )
+    .then(function(r) {
+      if (r.rowCount === 0) {
+        return res.status(404).json({ success: false, message: 'Événement non trouvé' });
+      }
+      logAudit(req.admin.id, 'event.commission_rate_update', 'event', r.rows[0].id, {
+        title: r.rows[0].title,
+        new_rate: rate,
+      });
+      res.json({
+        success: true,
+        event: {
+          id: r.rows[0].id.toString(),
+          commission_rate: r.rows[0].commission_rate !== null
+            ? parseFloat(r.rows[0].commission_rate) : null,
+        },
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/events/:id/commission-rate:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
@@ -1075,7 +1124,7 @@ router.post('/events/:id/schedule-payout', auth.requireAdminRole(['finance']), f
 
   Promise.all([
     pool.query(
-      'SELECT id, organizer_id, title, start_at, end_at FROM events WHERE id = $1',
+      'SELECT id, organizer_id, title, start_at, end_at, commission_rate FROM events WHERE id = $1',
       [eventId]
     ),
     pool.query(
@@ -1121,7 +1170,11 @@ router.post('/events/:id/schedule-payout', auth.requireAdminRole(['finance']), f
         });
       }
 
-      var commissionRate = parseFloat(results[3]);
+      // Override per-event prend précédence sur le défaut global.
+      var globalRate = parseFloat(results[3]);
+      var commissionRate = event.commission_rate !== null
+        ? parseFloat(event.commission_rate)
+        : globalRate;
       var feeRate = parseFloat(results[4]);
       var escrowHours = parseInt(results[5]);
 
@@ -2220,17 +2273,38 @@ router.patch('/support/tickets/:id', function(req, res) {
 // commissions, refunds, breakdown méthodes, série quotidienne 30j.
 
 router.get('/finance', function(req, res) {
-  Promise.all([
-    // 1. Bookings confirmed : mois courant + précédent
+  // Pre-fetch settings pour avoir le taux global avant de lancer les queries
+  // bookings (qui doivent passer le taux comme param SQL pour le COALESCE
+  // per-event).
+  pool.query(
+    "SELECT key, value FROM app_settings " +
+    "WHERE key IN ('commission_rate', 'cinetpay_fee_rate', 'tva_rate')"
+  ).then(function(settingsResult) {
+    var settings = {};
+    settingsResult.rows.forEach(function(s) { settings[s.key] = parseFloat(s.value); });
+    var commissionRate = settings.commission_rate || 0.06;
+    var feeRate = settings.cinetpay_fee_rate || 0.015;
+    var tvaRate = settings.tva_rate || 0.18;
+
+  return Promise.all([
+    // 1. Bookings confirmed : mois courant + précédent.
+    //    Commission calculée per-event via COALESCE(e.commission_rate, $1).
     pool.query(
       "SELECT " +
-      "COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW()))::int AS bookings_this, " +
-      "COALESCE(SUM(total_amount) FILTER (WHERE created_at >= date_trunc('month', NOW())), 0)::bigint AS revenue_this, " +
-      "COUNT(*) FILTER (WHERE created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
-      "  AND created_at < date_trunc('month', NOW()))::int AS bookings_prev, " +
-      "COALESCE(SUM(total_amount) FILTER (WHERE created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
-      "  AND created_at < date_trunc('month', NOW())), 0)::bigint AS revenue_prev " +
-      "FROM bookings WHERE statut = 'confirme'"
+      "COUNT(*) FILTER (WHERE b.created_at >= date_trunc('month', NOW()))::int AS bookings_this, " +
+      "COALESCE(SUM(b.total_amount) FILTER (WHERE b.created_at >= date_trunc('month', NOW())), 0)::bigint AS revenue_this, " +
+      "COALESCE(SUM(b.total_amount * COALESCE(e.commission_rate, $1)) " +
+      "  FILTER (WHERE b.created_at >= date_trunc('month', NOW())), 0)::bigint AS commission_this, " +
+      "COUNT(*) FILTER (WHERE b.created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
+      "  AND b.created_at < date_trunc('month', NOW()))::int AS bookings_prev, " +
+      "COALESCE(SUM(b.total_amount) FILTER (WHERE b.created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
+      "  AND b.created_at < date_trunc('month', NOW())), 0)::bigint AS revenue_prev, " +
+      "COALESCE(SUM(b.total_amount * COALESCE(e.commission_rate, $1)) " +
+      "  FILTER (WHERE b.created_at >= date_trunc('month', NOW() - INTERVAL '1 month') " +
+      "    AND b.created_at < date_trunc('month', NOW())), 0)::bigint AS commission_prev " +
+      "FROM bookings b JOIN events e ON e.id = b.event_id " +
+      "WHERE b.statut = 'confirme'",
+      [commissionRate]
     ),
     // 2. Payouts par statut : à reverser (scheduled + blocked) et déjà reversé ce mois
     pool.query(
@@ -2270,11 +2344,6 @@ router.get('/finance', function(req, res) {
       "AND created_at >= NOW() - INTERVAL '30 days' " +
       'GROUP BY DATE(created_at) ORDER BY day ASC'
     ),
-    // 6. Settings (taux commission + fees + TVA)
-    pool.query(
-      "SELECT key, value FROM app_settings " +
-      "WHERE key IN ('commission_rate', 'cinetpay_fee_rate', 'tva_rate')"
-    ),
   ])
     .then(function(r) {
       var bk = r[0].rows[0];
@@ -2282,17 +2351,12 @@ router.get('/finance', function(req, res) {
       var rf = r[2].rows[0];
       var methods = r[3].rows;
       var daily = r[4].rows;
-      var settings = {};
-      r[5].rows.forEach(function(s) { settings[s.key] = parseFloat(s.value); });
-
-      var commissionRate = settings.commission_rate || 0.06;
-      var feeRate = settings.cinetpay_fee_rate || 0.015;
-      var tvaRate = settings.tva_rate || 0.18;
 
       var revenueThis = parseInt(bk.revenue_this) || 0;
       var revenuePrev = parseInt(bk.revenue_prev) || 0;
-      var commissionThis = Math.ceil(revenueThis * commissionRate);
-      var commissionPrev = Math.ceil(revenuePrev * commissionRate);
+      // Commission per-event déjà sommée en SQL via COALESCE(e.commission_rate, $globalRate).
+      var commissionThis = parseInt(bk.commission_this) || 0;
+      var commissionPrev = parseInt(bk.commission_prev) || 0;
       var feesThis = Math.ceil(revenueThis * feeRate);
       var refundsAmount = parseInt(rf.amount) || 0;
 
@@ -2347,11 +2411,11 @@ router.get('/finance', function(req, res) {
           }),
         },
       });
-    })
-    .catch(function(err) {
-      console.error('Erreur GET /admin/finance:', err.message);
-      res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
+  }).catch(function(err) {
+    console.error('Erreur GET /admin/finance:', err.message);
+    res.status(500).json({ success: false, message: 'Erreur serveur' });
+  });
 });
 
 // ============================================================

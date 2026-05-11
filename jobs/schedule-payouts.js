@@ -67,7 +67,11 @@ function createPayoutForEvent(event, settings) {
       return { created: false };
     }
 
-    var commission = Math.ceil(gross * settings.commissionRate);
+    // Per-event override (event.commission_rate) prend précédence sur le défaut global.
+    var effectiveRate = event.commission_rate !== null && event.commission_rate !== undefined
+      ? parseFloat(event.commission_rate)
+      : settings.commissionRate;
+    var commission = Math.ceil(gross * effectiveRate);
     var fees = Math.ceil(gross * settings.feeRate);
     var net = gross - commission - fees;
 
@@ -120,7 +124,7 @@ function scheduleDuePayouts() {
       // SQL : events approved, end_at + escrow <= NOW(), pas de payout actif.
       // COALESCE(end_at, start_at) pour les events sans end_at explicite.
       return pool.query(
-        'SELECT e.id, e.organizer_id, e.title, e.start_at, e.end_at ' +
+        'SELECT e.id, e.organizer_id, e.title, e.start_at, e.end_at, e.commission_rate ' +
         'FROM events e ' +
         "WHERE e.status = 'approved' " +
         "  AND COALESCE(e.end_at, e.start_at) IS NOT NULL " +
