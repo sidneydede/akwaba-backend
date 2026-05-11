@@ -358,6 +358,22 @@ CREATE INDEX IF NOT EXISTS idx_follows_orga ON follows(organisateur_id);\n\
 -- fois (premier passage status='approved'). Si admin reject puis re-approve,\n\
 -- on ne re-notifie pas.\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS followers_notified_at TIMESTAMP;\n\
+\n\
+-- ============================================================\n\
+-- REVIEW-01 : Avis publics sur events (P3.1)\n\
+-- ============================================================\n\
+-- Different du feedback (NPS prive). Reviews = note + commentaire publics\n\
+-- affiches sur la fiche event (social proof). 1 avis max par user par event.\n\
+CREATE TABLE IF NOT EXISTS reviews (\n\
+  id SERIAL PRIMARY KEY,\n\
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n\
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,\n\
+  rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),\n\
+  comment TEXT,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  UNIQUE (user_id, event_id)\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_reviews_event ON reviews(event_id, created_at DESC);\n\
 ";
 
 console.log('Migration en cours...');
