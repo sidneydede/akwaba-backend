@@ -1697,6 +1697,129 @@ router.patch('/users/:id/payout-account', function(req, res) {
 });
 
 // ============================================================
+// ADM-HEALTH : Score santé organisateur
+// ============================================================
+// Score composite 0-100 sur 4 axes pondérés :
+//   - Note moyenne reviews (max 50 pts)         → satisfaction client
+//   - Taux refund inverse (max 20 pts)          → discipline annulations
+//   - Taux approval (max 15 pts)                → qualité des soumissions
+//   - Taux check-in (max 15 pts)                → no-show inverse
+//
+// Total max = 100. Bucket :
+//   80+   = excellent     (vert)
+//   60-79 = bon           (vert clair)
+//   40-59 = moyen         (ocre)
+//   <40   = à surveiller  (rose)
+//   N/A   = pas assez de données (orga < 3 events ou 0 booking)
+
+// GET /admin/users/:id/health — Stats agrégées + score pour un organisateur.
+// Renvoie 400 si l'user n'est pas organisateur (pas pertinent).
+router.get('/users/:id/health', function(req, res) {
+  var userId = req.params.id;
+
+  pool.query("SELECT id, role FROM users WHERE id = $1", [userId])
+    .then(function(r) {
+      if (r.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Utilisateur non trouvé' });
+      }
+      if (r.rows[0].role !== 'organisateur') {
+        return res.status(400).json({
+          success: false,
+          message: 'Health score réservé aux organisateurs',
+        });
+      }
+
+      return Promise.all([
+        // Events stats
+        pool.query(
+          "SELECT " +
+          "COUNT(*) FILTER (WHERE status = 'approved')::int AS events_approved, " +
+          "COUNT(*) FILTER (WHERE status = 'rejected')::int AS events_rejected, " +
+          "COUNT(*) FILTER (WHERE status = 'pending')::int AS events_pending, " +
+          "COUNT(*)::int AS events_total " +
+          "FROM events WHERE organizer_id = $1",
+          [userId]
+        ),
+        // Bookings stats sur tous ses events
+        pool.query(
+          'SELECT ' +
+          'COUNT(b.id)::int AS bookings_total, ' +
+          "COUNT(b.id) FILTER (WHERE b.statut = 'confirme' AND b.cancelled_at IS NULL)::int AS bookings_confirmed, " +
+          'COUNT(b.id) FILTER (WHERE b.cancelled_at IS NOT NULL)::int AS bookings_cancelled, ' +
+          'COUNT(b.id) FILTER (WHERE b.utilise_at IS NOT NULL)::int AS bookings_used ' +
+          'FROM bookings b JOIN events e ON e.id = b.event_id ' +
+          'WHERE e.organizer_id = $1',
+          [userId]
+        ),
+        // Reviews stats sur tous ses events
+        pool.query(
+          'SELECT ' +
+          'COUNT(*)::int AS reviews_count, ' +
+          'AVG(rating)::numeric(3,2) AS avg_rating ' +
+          'FROM reviews r JOIN events e ON e.id = r.event_id ' +
+          'WHERE e.organizer_id = $1',
+          [userId]
+        ),
+      ]).then(function(results) {
+        var ev = results[0].rows[0];
+        var bk = results[1].rows[0];
+        var rv = results[2].rows[0];
+
+        var avgRating = rv.avg_rating !== null ? parseFloat(rv.avg_rating) : null;
+        var refundRate = bk.bookings_total > 0
+          ? bk.bookings_cancelled / bk.bookings_total : null;
+        var rejectionRate = ev.events_total > 0
+          ? ev.events_rejected / ev.events_total : null;
+        var checkinRate = bk.bookings_confirmed > 0
+          ? bk.bookings_used / bk.bookings_confirmed : null;
+
+        // Score N/A si insuffisant de données (moins de 3 events OU 0 booking)
+        var canScore = ev.events_total >= 3 && bk.bookings_total > 0;
+        var score = null;
+        var bucket = 'insufficient';
+        if (canScore) {
+          var ratingPart = avgRating !== null ? avgRating * 10 : 35; // baseline 3.5/5 si pas de reviews
+          var refundPart = (1 - (refundRate || 0)) * 20;
+          var approvalPart = (1 - (rejectionRate || 0)) * 15;
+          var checkinPart = (checkinRate !== null ? checkinRate : 0.7) * 15; // baseline 70% si null
+          score = Math.round(ratingPart + refundPart + approvalPart + checkinPart);
+          if (score >= 80) bucket = 'excellent';
+          else if (score >= 60) bucket = 'good';
+          else if (score >= 40) bucket = 'fair';
+          else bucket = 'at_risk';
+        }
+
+        res.json({
+          success: true,
+          health: {
+            score: score,
+            bucket: bucket,
+            metrics: {
+              events_total: ev.events_total,
+              events_approved: ev.events_approved,
+              events_rejected: ev.events_rejected,
+              events_pending: ev.events_pending,
+              bookings_total: bk.bookings_total,
+              bookings_confirmed: bk.bookings_confirmed,
+              bookings_cancelled: bk.bookings_cancelled,
+              bookings_used: bk.bookings_used,
+              reviews_count: rv.reviews_count,
+              avg_rating: avgRating,
+              refund_rate: refundRate,
+              rejection_rate: rejectionRate,
+              checkin_rate: checkinRate,
+            },
+          },
+        });
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /admin/users/:id/health:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// ============================================================
 // ADM-DIGEST : Trigger manuel du digest quotidien
 // ============================================================
 
