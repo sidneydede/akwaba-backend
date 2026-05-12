@@ -58,6 +58,43 @@ function otpLimits(role) {
   return { maxAttempts: 5, lockoutMinutes: 15 };
 }
 
+// Helper : génère + stocke + envoie un OTP pour une registration EN ATTENTE
+// (pas encore promue en users). Le user n'existe pas tant que l'OTP n'est
+// pas validé — évite la pollution DB par les inscriptions abandonnées et
+// le squatting de numéros.
+// @param {object} pending - { phone, nom, prenom, role }
+// @returns {Promise<object>} { dev_otp?: string, sms_error?: any }
+function issuePendingOtp(pending) {
+  var code = generateOtp();
+  var expires = otpExpiry(pending.role || 'participant');
+  return auth.hashPassword(code)
+    .then(function(hash) {
+      // UPSERT : si le user retape register pour le même phone (modif nom,
+      // ou re-essai après abandon), on remplace l'entrée pending sans
+      // dupliquer. Compteurs d'attempts réinitialisés.
+      return pool.query(
+        'INSERT INTO pending_registrations (phone, nom, prenom, role, otp_hash, otp_expires_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6) ' +
+        'ON CONFLICT (phone) DO UPDATE SET ' +
+        'nom = EXCLUDED.nom, prenom = EXCLUDED.prenom, role = EXCLUDED.role, ' +
+        'otp_hash = EXCLUDED.otp_hash, otp_expires_at = EXCLUDED.otp_expires_at, ' +
+        'otp_attempts = 0, otp_locked_until = NULL, created_at = NOW()',
+        [pending.phone, pending.nom, pending.prenom, pending.role || 'participant', hash, expires]
+      );
+    })
+    .then(function() {
+      return sms.sendOtp(pending.phone, code);
+    })
+    .then(function(smsResult) {
+      if (smsResult.dev) return { dev_otp: code };
+      if (smsResult.success === false) {
+        console.error('[issuePendingOtp] SMS rejected:', pending.phone, JSON.stringify(smsResult.error));
+        return { sms_error: smsResult.error };
+      }
+      return {};
+    });
+}
+
 // Helper : génère + stocke + envoie un OTP pour un user existant.
 // Reset les compteurs d'attempts (nouveau code = nouvelle fenêtre de tentatives).
 // @param {object} user - Ligne user PostgreSQL (au minimum: id, phone, role)
@@ -96,12 +133,14 @@ function issueOtp(user) {
     });
 }
 
-// POST /auth/register — Crée un compte et envoie un OTP par SMS
+// POST /auth/register — Inscription : envoie un OTP, NE crée PAS le compte.
+// Le user n'est créé qu'à la validation de l'OTP (POST /auth/verify-otp).
+// Évite le squatting de numéros + pollution DB par tests abandonnés.
 // @body {string} nom, prenom, phone, role
 router.post('/register', function(req, res) {
-  var nom = req.body.nom;
-  var prenom = req.body.prenom;
-  var phone = req.body.phone;
+  var nom = (req.body.nom || '').trim();
+  var prenom = (req.body.prenom || '').trim();
+  var phone = (req.body.phone || '').trim();
   var role = req.body.role || 'participant';
 
   if (!nom || !prenom || !phone) {
@@ -110,49 +149,44 @@ router.post('/register', function(req, res) {
       message: 'Nom, prénom et téléphone sont obligatoires'
     });
   }
+  if (nom.length > 100 || prenom.length > 100 || phone.length > 20) {
+    return res.status(400).json({ success: false, message: 'Champ(s) trop long(s)' });
+  }
+  if (['participant', 'organisateur'].indexOf(role) === -1) {
+    return res.status(400).json({ success: false, message: 'Rôle invalide' });
+  }
 
+  // Si un user EXISTE déjà avec ce phone → bascule sur le flow login.
+  // (UX-friendly : "Connecte-toi" plutôt que "Numéro déjà pris".)
   pool.query('SELECT id, phone FROM users WHERE phone = $1', [phone])
     .then(function(result) {
       if (result.rows.length > 0) {
         return res.status(409).json({
           success: false,
-          message: 'Ce numéro de téléphone est déjà utilisé'
+          code: 'PHONE_REGISTERED',
+          message: 'Ce numéro est déjà inscrit. Utilise "Se connecter".',
         });
       }
 
-      // REF-01 : genere un referral_code unique pour le nouveau user (5 retries
-      // contre collision UNIQUE). Si echoue, le user est cree quand meme avec
-      // referral_code NULL — un job de backfill peut rattraper plus tard.
-      return generateUniqueReferralCode()
-        .catch(function(err) {
-          console.warn('register: referral_code generation failed', err.message);
-          return null;
-        })
-        .then(function(referralCode) {
-          return pool.query(
-            'INSERT INTO users (nom, prenom, phone, role, referral_code) VALUES ($1, $2, $3, $4, $5) RETURNING id, phone, role',
-            [nom, prenom, phone, role, referralCode]
-          )
-            .then(function(insertResult) {
-              var user = insertResult.rows[0];
-              return issueOtp(user).then(function(extra) {
-                if (extra.sms_error) {
-                  return res.status(502).json({
-                    success: false,
-                    code: 'SMS_DELIVERY_FAILED',
-                    message: 'Compte créé mais le SMS n\'a pas pu être envoyé. Réessaye via /auth/request-otp.',
-                    phone: user.phone,
-                    sms_error: extra.sms_error
-                  });
-                }
-                res.status(201).json(Object.assign({
-                  success: true,
-                  message: 'Compte créé. Un code de vérification vous a été envoyé par SMS.',
-                  phone: user.phone,
-                  next: 'verify-otp'
-                }, extra));
-              });
+      // Le user n'existe pas → on stocke en pending_registrations et on
+      // envoie l'OTP. La création réelle attend la validation du code.
+      return issuePendingOtp({ phone: phone, nom: nom, prenom: prenom, role: role })
+        .then(function(extra) {
+          if (extra.sms_error) {
+            return res.status(502).json({
+              success: false,
+              code: 'SMS_DELIVERY_FAILED',
+              message: 'Le SMS n\'a pas pu être envoyé. Vérifie le numéro ou réessaie.',
+              phone: phone,
+              sms_error: extra.sms_error,
             });
+          }
+          res.status(201).json(Object.assign({
+            success: true,
+            message: 'Un code de vérification a été envoyé par SMS. Saisis-le pour activer ton compte.',
+            phone: phone,
+            next: 'verify-otp',
+          }, extra));
         });
     })
     .catch(function(err) {
@@ -230,7 +264,9 @@ router.post('/verify-otp', function(req, res) {
   )
     .then(function(result) {
       if (result.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Compte introuvable' });
+        // Pas de user existant → check si registration pending. Si oui,
+        // valide l'OTP et CRÉE le user. Sinon "Compte introuvable".
+        return verifyPendingRegistration(phone, code, req, res);
       }
 
       var user = result.rows[0];
@@ -326,6 +362,105 @@ function acceptOtp(user, req, res) {
         token: token,
       });
     });
+}
+
+// Helper : valide l'OTP d'une pending_registration et crée le user si OK.
+// Appelé par /auth/verify-otp quand aucun user n'existe pour ce phone.
+function verifyPendingRegistration(phone, code, req, res) {
+  return pool.query(
+    'SELECT phone, nom, prenom, role, otp_hash, otp_expires_at, otp_attempts, otp_locked_until ' +
+    'FROM pending_registrations WHERE phone = $1',
+    [phone]
+  ).then(function(pendingResult) {
+    if (pendingResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Compte introuvable' });
+    }
+    var pending = pendingResult.rows[0];
+    var limits = otpLimits(pending.role);
+
+    if (pending.otp_locked_until && new Date(pending.otp_locked_until).getTime() > Date.now()) {
+      var minutesLeft = Math.ceil((new Date(pending.otp_locked_until).getTime() - Date.now()) / 60000);
+      return res.status(429).json({
+        success: false,
+        code: 'LOCKED',
+        message: 'Trop de tentatives. Réessayez dans ' + minutesLeft + ' minute' +
+          (minutesLeft > 1 ? 's' : '') + '.',
+      });
+    }
+
+    if (new Date(pending.otp_expires_at).getTime() < Date.now()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Code expiré. Renvoie une demande d\'inscription.',
+      });
+    }
+
+    return auth.verifyPassword(code, pending.otp_hash).then(function(matched) {
+      if (!matched) {
+        var newAttempts = (pending.otp_attempts || 0) + 1;
+        if (newAttempts >= limits.maxAttempts) {
+          var lockUntil = new Date(Date.now() + limits.lockoutMinutes * 60 * 1000);
+          return pool.query(
+            'UPDATE pending_registrations SET otp_attempts = $1, otp_locked_until = $2, ' +
+            'otp_hash = NULL WHERE phone = $3',
+            [newAttempts, lockUntil, phone]
+          ).then(function() {
+            res.status(429).json({
+              success: false,
+              code: 'LOCKED',
+              message: 'Trop de tentatives. Inscription verrouillée pendant ' +
+                limits.lockoutMinutes + ' minutes.',
+            });
+          });
+        }
+        return pool.query(
+          'UPDATE pending_registrations SET otp_attempts = $1 WHERE phone = $2',
+          [newAttempts, phone]
+        ).then(function() {
+          res.status(400).json({
+            success: false,
+            message: 'Code incorrect',
+            attempts_left: limits.maxAttempts - newAttempts,
+          });
+        });
+      }
+
+      // OTP VALIDÉ : promote pending → user. Génère referral_code, INSERT
+      // users, DELETE pending, retourne token. Trace REGISTER dans audit.
+      return generateUniqueReferralCode()
+        .catch(function() { return null; })
+        .then(function(referralCode) {
+          return pool.query(
+            'INSERT INTO users (nom, prenom, phone, role, referral_code, last_login_at) ' +
+            'VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id, nom, prenom, phone, role',
+            [pending.nom, pending.prenom, pending.phone, pending.role, referralCode]
+          );
+        })
+        .then(function(insRes) {
+          var user = insRes.rows[0];
+          // Cleanup pending (le user existe maintenant pour de vrai)
+          pool.query('DELETE FROM pending_registrations WHERE phone = $1', [phone])
+            .catch(function(err) {
+              console.error('Erreur cleanup pending:', err.message);
+            });
+          var token = auth.generateToken(user.id);
+          userAudit.log(user.id, userAudit.ACTIONS.REGISTER, req, { phone: user.phone });
+          userAudit.log(user.id, userAudit.ACTIONS.LOGIN, req, { phone: user.phone });
+          res.status(201).json({
+            success: true,
+            message: 'Compte activé. Bienvenue !',
+            user: {
+              id: user.id.toString(),
+              nom: user.nom,
+              prenom: user.prenom,
+              phone: user.phone,
+              role: user.role,
+            },
+            token: token,
+          });
+        });
+    });
+  });
 }
 
 // GET /auth/me/activity — Le user voit son propre historique d'activité.

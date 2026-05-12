@@ -24,14 +24,18 @@ function tick() {
     pool.query("DELETE FROM search_queries WHERE created_at < NOW() - INTERVAL '90 days'"),
     pool.query("DELETE FROM admin_digests WHERE digest_date < (CURRENT_DATE - INTERVAL '180 days')"),
     pool.query("DELETE FROM admin_audit_log WHERE created_at < NOW() - INTERVAL '365 days'"),
+    // ONBOARDING-DEFER : pending_registrations abandonnés > 24h. L'OTP
+    // expire en 5-10 min de toute façon, donc 24h est large.
+    pool.query("DELETE FROM pending_registrations WHERE created_at < NOW() - INTERVAL '24 hours'"),
   ])
     .then(function(results) {
       var counts = {
         search_queries: results[0].rowCount || 0,
         admin_digests: results[1].rowCount || 0,
         admin_audit_log: results[2].rowCount || 0,
+        pending_registrations: results[3].rowCount || 0,
       };
-      var total = counts.search_queries + counts.admin_digests + counts.admin_audit_log;
+      var total = counts.search_queries + counts.admin_digests + counts.admin_audit_log + counts.pending_registrations;
       var elapsedMs = Date.now() - start;
       if (total > 0) {
         console.log('[data-retention] Deleted ' + total + ' expired rows in ' +

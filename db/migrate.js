@@ -651,6 +651,28 @@ CREATE INDEX IF NOT EXISTS idx_user_audit_action ON user_audit_log(action, creat
 -- tous ses tokens en circulation deviennent invalides immédiatement.\n\
 -- NULL = pas encore set (pas de révocation forcée).\n\
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP;\n\
+\n\
+-- ============================================================\n\
+-- ONBOARDING-DEFER : User créé seulement après OTP validé\n\
+-- ============================================================\n\
+-- Avant : POST /auth/register créait immédiatement la ligne users + envoyait\n\
+-- OTP. Conséquence : DB polluée par chaque test abandonné + phone squatting\n\
+-- (un attaquant peut bloquer un numéro tiers via la contrainte UNIQUE).\n\
+-- Après : POST /auth/register stocke ici (pending). POST /auth/verify-otp\n\
+-- promote en users.* uniquement si le code est validé. Cleanup 24h via\n\
+-- jobs/data-retention.js pour les pending abandonnés.\n\
+CREATE TABLE IF NOT EXISTS pending_registrations (\n\
+  phone VARCHAR(20) PRIMARY KEY,\n\
+  nom VARCHAR(100) NOT NULL,\n\
+  prenom VARCHAR(100) NOT NULL,\n\
+  role VARCHAR(20) NOT NULL DEFAULT 'participant',\n\
+  otp_hash TEXT NOT NULL,\n\
+  otp_expires_at TIMESTAMP NOT NULL,\n\
+  otp_attempts INTEGER DEFAULT 0,\n\
+  otp_locked_until TIMESTAMP,\n\
+  created_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_pending_registrations_created ON pending_registrations(created_at);\n\
 ";
 
 console.log('Migration en cours...');
