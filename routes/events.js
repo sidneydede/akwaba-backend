@@ -444,9 +444,10 @@ router.get('/:id', function(req, res) {
     });
 });
 
-// POST /events/upload-signature — Génère une signature Cloudinary pour upload direct
-// par un organisateur depuis l'app mobile. Le fichier va direct chez Cloudinary,
-// pas par notre backend (économise bandwidth Render). Auth orga obligatoire.
+// POST /events/upload-signature — Signature Cloudinary pour upload direct
+// d'IMAGE ou VIDÉO par un organisateur. Le fichier va direct chez Cloudinary
+// (économise bandwidth Render). Auth orga obligatoire.
+// @body {string} type - 'image' (défaut) ou 'video'
 router.post('/upload-signature', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
   var crypto = require('crypto');
   var apiKey = process.env.CLOUDINARY_API_KEY;
@@ -460,8 +461,11 @@ router.post('/upload-signature', auth.authMiddleware, auth.requireOrganizer, fun
     });
   }
 
-  // Folder organisé par orga pour faciliter les permissions/cleanup futurs.
-  var folder = 'akwaba/events/' + req.userId;
+  // type=video → resource_type=video chez Cloudinary, sinon image (défaut).
+  var isVideo = req.body.type === 'video';
+  var resourceType = isVideo ? 'video' : 'image';
+  // Folder organisé par orga + type pour cleanup futur facile.
+  var folder = 'akwaba/events/' + req.userId + (isVideo ? '/videos' : '');
   var timestamp = Math.floor(Date.now() / 1000);
   var paramsToSign = 'folder=' + folder + '&timestamp=' + timestamp;
   var signature = crypto.createHash('sha1').update(paramsToSign + apiSecret).digest('hex');
@@ -473,7 +477,8 @@ router.post('/upload-signature', auth.authMiddleware, auth.requireOrganizer, fun
     api_key: apiKey,
     cloud_name: cloudName,
     folder: folder,
-    upload_url: 'https://api.cloudinary.com/v1_1/' + cloudName + '/image/upload',
+    resource_type: resourceType,
+    upload_url: 'https://api.cloudinary.com/v1_1/' + cloudName + '/' + resourceType + '/upload',
   });
 });
 
@@ -528,8 +533,25 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
     if (!isNaN(de.getTime())) endAt = de;
   }
 
+  // EVENT-VIDEO : whitelist Cloudinary tenant pour video_url (anti XSS).
+  var videoUrl = null;
+  if (body.video_url) {
+    var rawUrl = String(body.video_url).trim();
+    var cloud = process.env.CLOUDINARY_CLOUD_NAME || '';
+    var allowedPrefix = cloud ? 'https://res.cloudinary.com/' + cloud + '/' : null;
+    if (allowedPrefix && rawUrl.indexOf(allowedPrefix) === 0 && rawUrl.length <= 500) {
+      videoUrl = rawUrl;
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: 'video_url doit être une URL Cloudinary du tenant Akwaba.',
+      });
+    }
+  }
+
   pool.query(
-    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, places_total, places_restantes, organizer_id, latitude, longitude, start_at, end_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, $17) RETURNING *',
+    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, video_url, places_total, places_restantes, organizer_id, latitude, longitude, start_at, end_at) ' +
+    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14, $15, $16, $17, $18) RETURNING *',
     [
       body.title,
       body.description || '',
@@ -542,6 +564,7 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
       body.color || '#E67E22',
       body.chaud || false,
       body.image_url || null,
+      videoUrl,
       placesTotal,
       req.userId,
       latitude,
@@ -636,6 +659,27 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         if (!isNaN(dee.getTime())) newEndAt = dee;
       }
 
+      // EVENT-VIDEO : valide video_url contre tenant Cloudinary.
+      // undefined → COALESCE garde l'ancienne valeur.
+      // null explicite → vide la vidéo.
+      // string → doit être Cloudinary du tenant.
+      var newVideoUrl = undefined;
+      if (body.video_url === null || body.video_url === '') {
+        newVideoUrl = null; // clear
+      } else if (body.video_url !== undefined) {
+        var rawV = String(body.video_url).trim();
+        var cloudV = process.env.CLOUDINARY_CLOUD_NAME || '';
+        var allowedV = cloudV ? 'https://res.cloudinary.com/' + cloudV + '/' : null;
+        if (allowedV && rawV.indexOf(allowedV) === 0 && rawV.length <= 500) {
+          newVideoUrl = rawV;
+        } else {
+          return res.status(400).json({
+            success: false,
+            message: 'video_url doit être une URL Cloudinary du tenant Akwaba.',
+          });
+        }
+      }
+
       return pool.query(
         'UPDATE events SET ' +
         'title = COALESCE($1, title), ' +
@@ -649,6 +693,7 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         'color = COALESCE($9, color), ' +
         'chaud = COALESCE($10, chaud), ' +
         'image_url = COALESCE($11, image_url), ' +
+        'video_url = CASE WHEN $18::boolean THEN $19 ELSE video_url END, ' +
         'places_total = COALESCE($12, places_total), ' +
         'places_restantes = COALESCE($13, places_restantes), ' +
         'latitude = COALESCE($14, latitude), ' +
@@ -656,7 +701,7 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         'start_at = COALESCE($16, start_at), ' +
         'end_at = COALESCE($17, end_at), ' +
         'updated_at = NOW() ' +
-        'WHERE id = $18 RETURNING *',
+        'WHERE id = $20 RETURNING *',
         [
           body.title || null,
           body.description !== undefined ? body.description : null,
@@ -675,6 +720,8 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
           longitude,
           newStartAt,
           newEndAt,
+          newVideoUrl !== undefined,  // $18 — flag : faut-il toucher video_url ?
+          newVideoUrl,                // $19 — la nouvelle valeur (null ou string)
           eventId
         ]
       )

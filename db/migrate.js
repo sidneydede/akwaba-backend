@@ -673,6 +673,14 @@ CREATE TABLE IF NOT EXISTS pending_registrations (\n\
   created_at TIMESTAMP DEFAULT NOW()\n\
 );\n\
 CREATE INDEX IF NOT EXISTS idx_pending_registrations_created ON pending_registrations(created_at);\n\
+\n\
+-- ============================================================\n\
+-- EVENT-VIDEO : Vidéo loop optionnelle par event (upload orga)\n\
+-- ============================================================\n\
+-- L'orga peut uploader une vidéo MP4 lors de la création/édition d'event.\n\
+-- Si présente, la vidéo joue en hero (priorité sur image_url et défauts catégorie).\n\
+-- Validation Cloudinary tenant côté API (anti XSS/injection).\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS video_url TEXT;\n\
 ";
 
 console.log('Migration en cours...');
