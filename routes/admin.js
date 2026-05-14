@@ -11,17 +11,73 @@ var push = require('../services/push');
 var cinetpay = require('../services/cinetpay');
 var followsRouter = require('./follows');
 
-// Rate limit sur le login admin : 5 tentatives / 15 min par IP.
-// Compte uniquement les échecs (skipSuccessfulRequests) — un admin qui se
-// reconnecte plein de fois ne se fera pas bloquer. En back-office on accepte
-// un faux positif occasionnel : mieux qu'autoriser un brute force.
+// Rate-limit login admin — défense en profondeur (3 couches).
+//
+// Contexte : le portail admin Next.js (Vercel) proxifie le login vers ce
+// backend. Sans config supplémentaire, `req.ip` côté backend = IP du serveur
+// Vercel (partagée par tous les clients qui passent par admin.akwaba.app),
+// pas l'IP réelle du client. Le rate-limit par IP serait donc soit inefficace
+// (un client = 1 sur 100k requêtes Vercel) soit auto-DDoS (tout le monde
+// bloqué quand un seul attaque). Le admin Next.js forwarde donc le vrai IP
+// client via le header `X-Real-IP` (cf. app/api/auth/login/route.ts).
+//
+// Couche 1 — keyGenerator personnalisé :
+//   - Si `X-Real-IP` est fourni (cas Vercel-proxied), on l'utilise comme clé
+//   - Sinon fallback sur req.ip (cas où l'attaquant tape le backend en direct)
+//   - Risque résiduel : un attaquant peut spoofer X-Real-IP côté call direct
+//     pour bypasser la couche 1. La couche 2 (global limiter) protège.
+//
+// Couche 2 — limiter global :
+//   - Backstop absolu, 50 tentatives échouées /h pour TOUS les clients
+//   - Si déclenché → bloque toutes les nouvelles tentatives pour 1h + alert
+//     Sentry (capture l'évènement, Sidney reçoit un email)
+//   - Empêche un attaquant déterminé de rotater des IPs ad infinitum
+//
+// Couche 3 — brute-force protection au niveau user (auth.js) :
+//   - Lockout 30 min après 3 fails consécutifs sur le même compte (déjà
+//     existant pour OTP, vérifier équivalent pour admin login si besoin)
+
+function getClientIp(req) {
+  var realIp = req.headers['x-real-ip'];
+  if (realIp && typeof realIp === 'string' && realIp.length < 64) return realIp;
+  return req.ip;
+}
+
 var adminLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
-  message: { success: false, message: 'Trop de tentatives. Réessayez dans 15 minutes.' }
+  keyGenerator: function(req) { return getClientIp(req); },
+  message: { success: false, message: 'Trop de tentatives. Réessayez dans 15 minutes.' },
+});
+
+// Limiter global anti-IP-rotation. Clé constante = lump tous les clients
+// ensemble. Seuil élevé (50/h) pour ne pas casser un usage légitime, mais
+// suffisant pour stopper un attaquant qui rotate.
+var adminLoginGlobalLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  standardHeaders: false,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  keyGenerator: function() { return 'admin-login-global'; },
+  handler: function(req, res) {
+    // Hit du backstop = signal sérieux → push à Sentry pour alert email.
+    try {
+      var Sentry = require('@sentry/node');
+      Sentry.captureMessage('Admin login global rate-limit triggered', {
+        level: 'warning',
+        tags: { rate_limit: 'admin_login_global' },
+        extra: { ip: getClientIp(req), userAgent: req.headers['user-agent'] },
+      });
+    } catch (e) { /* Sentry pas init, on continue */ }
+    res.status(429).json({
+      success: false,
+      message: 'Trop de tentatives sur ce service. Réessayez plus tard.',
+    });
+  },
 });
 
 // Pagination par défaut. Limite haute volontairement modeste pour
@@ -64,7 +120,7 @@ function readPagination(req) {
 // Sinon (admin pas encore 2FA-isé) → retourne le token complet + must_setup_2fa=true
 // pour que le front pousse direct sur l'écran de setup.
 // @body {string} email, password
-router.post('/auth/login', adminLoginLimiter, function(req, res) {
+router.post('/auth/login', adminLoginGlobalLimiter, adminLoginLimiter, function(req, res) {
   var email = (req.body.email || '').trim().toLowerCase();
   var password = req.body.password || '';
 
@@ -137,7 +193,7 @@ router.post('/auth/login', adminLoginLimiter, function(req, res) {
 // Reçoit le challenge_token issu de l'étape 1 + le code à 6 chiffres.
 // Si OK → retourne le token de session 8h.
 // @body {string} challenge_token, code
-router.post('/auth/login/verify', adminLoginLimiter, function(req, res) {
+router.post('/auth/login/verify', adminLoginGlobalLimiter, adminLoginLimiter, function(req, res) {
   var challengeToken = req.body.challenge_token || '';
   var code = (req.body.code || '').trim();
   if (!challengeToken || !code) {
