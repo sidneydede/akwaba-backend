@@ -93,6 +93,10 @@ router.get('/', function(req, res) {
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          // Alias lat/lng pour cohérence avec /favorites et le client mobile
+          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
           organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
           organisateur_prenom: row.organisateur_prenom || null,
           organisateur_nom: row.organisateur_nom || null,
@@ -202,6 +206,10 @@ router.get('/recommended', function(req, res) {
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          // Alias lat/lng pour cohérence avec /favorites et le client mobile
+          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
           organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
           organisateur_prenom: row.organisateur_prenom || null,
           organisateur_nom: row.organisateur_nom || null,
@@ -267,6 +275,10 @@ router.get('/mine', auth.authMiddleware, function(req, res) {
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          // Alias lat/lng pour cohérence avec /favorites et le client mobile
+          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
           places_vendues: row.places_vendues,
           revenue: parseInt(row.revenue) || 0,
           status: row.status,
@@ -431,6 +443,10 @@ router.get('/:id', function(req, res) {
           places_restantes: row.places_restantes,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          // Alias lat/lng pour cohérence avec /favorites et le client mobile
+          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
           organizer_id: row.organizer_id,
           organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
           organisateur_prenom: row.organisateur_prenom || null,
@@ -587,6 +603,10 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
           prix: row.prix_display,
           latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
           longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+          // Alias lat/lng pour cohérence avec /favorites et le client mobile
+          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
           status: row.status
         }
       });
@@ -746,7 +766,10 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
               places_total: row.places_total,
               places_restantes: row.places_restantes,
               latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-              longitude: row.longitude !== null ? parseFloat(row.longitude) : null
+              longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+              // Alias lat/lng pour cohérence avec /favorites + client mobile.
+              lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+              lng: row.longitude !== null ? parseFloat(row.longitude) : null
             }
           });
         });
