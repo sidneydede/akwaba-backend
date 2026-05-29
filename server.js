@@ -79,6 +79,11 @@ app.use(cors({
       'http://localhost:19006',
     ];
     if (allowed.indexOf(origin) !== -1) return callback(null, true);
+    // *.netlify.app — couvre la prod Netlify ET les deploy previews automatiques
+    // (deploy-preview-N--site.netlify.app, branch-deploy-foo--site.netlify.app).
+    // À resserrer plus tard si on configure un domaine custom akwaba.ci sur
+    // Netlify, ou si on veut whitelist un seul site Netlify précis.
+    if (origin && /\.netlify\.app$/.test(origin)) return callback(null, true);
     // En dev : permissif (ngrok, cloudflared, staging Vercel preview…)
     if (process.env.NODE_ENV !== 'production') {
       console.log('CORS (dev) accepté:', origin);
