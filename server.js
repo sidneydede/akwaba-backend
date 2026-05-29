@@ -68,10 +68,15 @@ app.use(cors({
   origin: function(origin, callback) {
     if (!origin) return callback(null, true);
     var allowed = [
+      // Domaine primaire EventNextDoor (prod) + legacy Akwaba (transition)
+      'https://event-next-door.com',
+      'https://www.event-next-door.com',
       'https://akwaba.ci',
       'https://www.akwaba.ci',
+      // Consoles admin
       'https://akwaba-admin.vercel.app',
       'https://admin.akwaba.app',
+      // Dev local
       'http://localhost:3000',
       'http://localhost:5173',
       'http://localhost:5174',
