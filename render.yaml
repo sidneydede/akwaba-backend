@@ -1,6 +1,6 @@
 databases:
   - name: akwaba-db
-    plan: free
+    plan: basic_256mb
     databaseName: akwaba_db
     user: akwaba_user
 
