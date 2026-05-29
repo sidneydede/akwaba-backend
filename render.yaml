@@ -9,6 +9,7 @@ services:
     name: akwaba-backend
     runtime: node
     plan: free
+    branch: master
     buildCommand: npm install
     startCommand: npm start
     envVars:
