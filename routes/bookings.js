@@ -718,32 +718,10 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
     });
 });
 
-// PATCH /bookings/:id/confirm — Confirme une réservation (après paiement)
-router.patch('/:id/confirm', function(req, res) {
-  var bookingId = req.params.id;
-  var transactionId = req.body.transaction_id;
-
-  pool.query(
-    "UPDATE bookings SET statut = 'confirme', transaction_id = $1, updated_at = NOW() WHERE id = $2 RETURNING *",
-    [transactionId, bookingId]
-  )
-    .then(function(result) {
-      if (result.rows.length === 0) {
-        return res.status(404).json({ success: false, message: 'Réservation non trouvée' });
-      }
-
-      notifyBookingConfirmed(result.rows[0].id);
-
-      res.json({
-        success: true,
-        message: 'Réservation confirmée',
-        booking: result.rows[0]
-      });
-    })
-    .catch(function(err) {
-      console.error('Erreur PATCH /bookings/:id/confirm:', err.message);
-      res.status(500).json({ success: false, message: 'Erreur serveur' });
-    });
-});
+// La confirmation d'une réservation (statut → 'confirme') se fait UNIQUEMENT
+// côté serveur dans le webhook CinetPay (/payments/notify), après vérification
+// HMAC + double-check de l'API CinetPay. Aucun endpoint client de confirmation
+// n'est exposé : un tel endpoint laisserait un utilisateur marquer sa propre
+// réservation comme payée sans encaissement réel.
 
 module.exports = router;

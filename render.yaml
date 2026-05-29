@@ -21,3 +21,36 @@ services:
         generateValue: true
       - key: NODE_ENV
         value: production
+      # Secrets renseignés dans le dashboard Render (sync: false = jamais en repo).
+      # OTP SMS (Africa's Talking) — REQUIS pour login/register
+      - key: AT_USERNAME
+        sync: false
+      - key: AT_API_KEY
+        sync: false
+      - key: AT_SENDER_ID
+        sync: false
+      # Paiements CinetPay — REQUIS pour la billetterie
+      - key: CINETPAY_API_KEY
+        sync: false
+      - key: CINETPAY_SITE_ID
+        sync: false
+      - key: CINETPAY_SECRET_KEY
+        sync: false
+      # Upload images (Cloudinary) — REQUIS pour events/avatars/bannières
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      # Optionnels — l'app dégrade gracieusement si absents
+      - key: QR_HMAC_SECRET   # fallback sur TOKEN_SECRET si non défini
+        sync: false
+      - key: SENTRY_DSN       # crash reporting
+        sync: false
+      - key: RESEND_API_KEY   # email du digest admin
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: FRONT_RETURN_URL # URL de retour après paiement CinetPay
+        sync: false
