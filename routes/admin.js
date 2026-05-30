@@ -15,7 +15,7 @@ var followsRouter = require('./follows');
 //
 // Contexte : le portail admin Next.js (Vercel) proxifie le login vers ce
 // backend. Sans config supplémentaire, `req.ip` côté backend = IP du serveur
-// Vercel (partagée par tous les clients qui passent par admin.akwaba.app),
+// Vercel (partagée par tous les clients qui passent par admin.event-next-door.com),
 // pas l'IP réelle du client. Le rate-limit par IP serait donc soit inefficace
 // (un client = 1 sur 100k requêtes Vercel) soit auto-DDoS (tout le monde
 // bloqué quand un seul attaque). Le admin Next.js forwarde donc le vrai IP

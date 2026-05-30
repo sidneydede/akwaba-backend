@@ -75,6 +75,7 @@ app.use(cors({
       'https://www.akwaba.ci',
       // Consoles admin
       'https://akwaba-admin.vercel.app',
+      'https://admin.event-next-door.com',
       'https://admin.akwaba.app',
       // Dev local
       'http://localhost:3000',
