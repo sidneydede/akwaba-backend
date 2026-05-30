@@ -6,7 +6,20 @@ var router = express.Router();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var sms = require('../services/sms');
+var email = require('../services/email');
 var userAudit = require('../services/userAudit');
+
+// Canaux OTP supportés. Toute valeur hors de cette liste → fallback 'sms'.
+var OTP_CHANNELS = ['sms', 'email'];
+
+// Normalise un canal user input vers une valeur connue, ou null si inconnu.
+// @param {string} value
+// @returns {string|null}
+function normalizeChannel(value) {
+  if (!value) return null;
+  var v = String(value).toLowerCase().trim();
+  return OTP_CHANNELS.indexOf(v) !== -1 ? v : null;
+}
 
 // Génère un code OTP à 6 chiffres (crypto-random, pas Math.random qui est prédictible).
 // @returns {string}
@@ -58,48 +71,75 @@ function otpLimits(role) {
   return { maxAttempts: 5, lockoutMinutes: 15 };
 }
 
+// Helper : envoie un OTP via le canal demandé. Retourne le résultat brut du
+// provider ({success, dev?, error?}) ou une erreur synthétique si pré-requis
+// non rempli (ex: channel='email' mais pas d'email destinataire).
+// @param {string} channel - 'sms' | 'email'
+// @param {object} target - { phone?, email? }
+// @param {string} code
+// @returns {Promise<object>}
+function deliverOtp(channel, target, code) {
+  if (channel === 'email') {
+    if (!target.email) {
+      return Promise.resolve({ success: false, error: 'EMAIL_REQUIRED' });
+    }
+    return email.sendOtp(target.email, code);
+  }
+  return sms.sendOtp(target.phone, code);
+}
+
 // Helper : génère + stocke + envoie un OTP pour une registration EN ATTENTE
 // (pas encore promue en users). Le user n'existe pas tant que l'OTP n'est
 // pas validé — évite la pollution DB par les inscriptions abandonnées et
 // le squatting de numéros.
-// @param {object} pending - { phone, nom, prenom, role }
-// @returns {Promise<object>} { dev_otp?: string, sms_error?: any }
-function issuePendingOtp(pending) {
+// @param {object} pending - { phone, nom, prenom, role, email? }
+// @param {string} channel - 'sms' | 'email' (défaut 'sms')
+// @returns {Promise<object>} { dev_otp?, delivery_error?, channel }
+function issuePendingOtp(pending, channel) {
+  var ch = normalizeChannel(channel) || 'sms';
   var code = generateOtp();
   var expires = otpExpiry(pending.role || 'participant');
+  var pendingEmail = pending.email ? email.normalizeEmail(pending.email) : null;
   return auth.hashPassword(code)
     .then(function(hash) {
       // UPSERT : si le user retape register pour le même phone (modif nom,
       // ou re-essai après abandon), on remplace l'entrée pending sans
-      // dupliquer. Compteurs d'attempts réinitialisés.
+      // dupliquer. Compteurs d'attempts réinitialisés. email peut être null.
       return pool.query(
-        'INSERT INTO pending_registrations (phone, nom, prenom, role, otp_hash, otp_expires_at) ' +
-        'VALUES ($1, $2, $3, $4, $5, $6) ' +
+        'INSERT INTO pending_registrations ' +
+        '(phone, nom, prenom, role, email, otp_channel, otp_hash, otp_expires_at) ' +
+        'VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ' +
         'ON CONFLICT (phone) DO UPDATE SET ' +
         'nom = EXCLUDED.nom, prenom = EXCLUDED.prenom, role = EXCLUDED.role, ' +
+        'email = COALESCE(EXCLUDED.email, pending_registrations.email), ' +
+        'otp_channel = EXCLUDED.otp_channel, ' +
         'otp_hash = EXCLUDED.otp_hash, otp_expires_at = EXCLUDED.otp_expires_at, ' +
         'otp_attempts = 0, otp_locked_until = NULL, created_at = NOW()',
-        [pending.phone, pending.nom, pending.prenom, pending.role || 'participant', hash, expires]
+        [pending.phone, pending.nom, pending.prenom, pending.role || 'participant',
+          pendingEmail, ch, hash, expires]
       );
     })
     .then(function() {
-      return sms.sendOtp(pending.phone, code);
+      return deliverOtp(ch, { phone: pending.phone, email: pendingEmail }, code);
     })
-    .then(function(smsResult) {
-      if (smsResult.dev) return { dev_otp: code };
-      if (smsResult.success === false) {
-        console.error('[issuePendingOtp] SMS rejected:', pending.phone, JSON.stringify(smsResult.error));
-        return { sms_error: smsResult.error };
+    .then(function(result) {
+      if (result.dev) return { dev_otp: code, channel: ch };
+      if (result.success === false) {
+        console.error('[issuePendingOtp] ' + ch + ' rejected:',
+          pending.phone, JSON.stringify(result.error));
+        return { delivery_error: result.error, channel: ch };
       }
-      return {};
+      return { channel: ch };
     });
 }
 
 // Helper : génère + stocke + envoie un OTP pour un user existant.
 // Reset les compteurs d'attempts (nouveau code = nouvelle fenêtre de tentatives).
-// @param {object} user - Ligne user PostgreSQL (au minimum: id, phone, role)
-// @returns {Promise<object>} { dev_otp?: string }
-function issueOtp(user) {
+// @param {object} user - Ligne user PostgreSQL (au minimum: id, phone, role, email?, last_otp_channel?)
+// @param {string} channel - 'sms' | 'email'. Défaut : user.last_otp_channel || 'sms' (sticky)
+// @returns {Promise<object>} { dev_otp?, delivery_error?, channel }
+function issueOtp(user, channel) {
+  var ch = normalizeChannel(channel) || normalizeChannel(user.last_otp_channel) || 'sms';
   var code = generateOtp();
   var expires = otpExpiry(user.role);
   // SEC H2 : hash le code avant store (scrypt, same format que password_hash).
@@ -114,22 +154,30 @@ function issueOtp(user) {
       );
     })
     .then(function() {
-      return sms.sendOtp(user.phone, code);
+      return deliverOtp(ch, { phone: user.phone, email: user.email }, code);
     })
-    .then(function(smsResult) {
+    .then(function(result) {
       // En mode dev, on renvoie l'OTP au client pour faciliter les tests
-      if (smsResult.dev) {
-        return { dev_otp: code };
+      if (result.dev) {
+        return { dev_otp: code, channel: ch };
       }
-      // Mode prod : si AT a rejeté le SMS, propager l'erreur au lieu de
-      // mentir au client. register/login regardent sms_error pour renvoyer
-      // un 502 explicite. Permet de diagnostiquer (sandbox non whitelisté,
-      // sender ID non approuvé, solde épuisé, etc.) sans accès aux logs Render.
-      if (smsResult.success === false) {
-        console.error('[issueOtp] SMS rejected by AT for', user.phone, ':', JSON.stringify(smsResult.error));
-        return { sms_error: smsResult.error };
+      // Mode prod : si le provider a rejeté l'envoi, propager l'erreur au lieu
+      // de mentir au client. register/login regardent delivery_error pour
+      // renvoyer un 502 explicite (SMS_DELIVERY_FAILED / EMAIL_DELIVERY_FAILED).
+      // Permet de diagnostiquer (sandbox non whitelisté, sender ID non approuvé,
+      // solde épuisé, DKIM cassé, etc.) sans accès aux logs Render.
+      if (result.success === false) {
+        console.error('[issueOtp] ' + ch + ' rejected for user', user.id, ':',
+          JSON.stringify(result.error));
+        return { delivery_error: result.error, channel: ch };
       }
-      return {};
+      // Succès : persiste le canal pour le proposer en sticky-default à la
+      // prochaine demande. Fire-and-forget (l'OTP est déjà parti).
+      pool.query('UPDATE users SET last_otp_channel = $1 WHERE id = $2', [ch, user.id])
+        .catch(function(err) {
+          console.error('[issueOtp] update last_otp_channel failed:', err.message);
+        });
+      return { channel: ch };
     });
 }
 
@@ -142,6 +190,12 @@ router.post('/register', function(req, res) {
   var prenom = (req.body.prenom || '').trim();
   var phone = (req.body.phone || '').trim();
   var role = req.body.role || 'participant';
+  // Email optionnel (cf. plan OTP multi-canal). Si fourni : doit être valide.
+  // Sert à recevoir l'OTP par email en fallback du SMS.
+  var rawEmail = (req.body.email || '').trim();
+  // Canal demandé pour l'OTP de validation du signup. Défaut SMS (le user
+  // peut basculer email depuis l'écran OTP via /request-otp).
+  var channel = normalizeChannel(req.body.channel) || 'sms';
 
   if (!nom || !prenom || !phone) {
     return res.status(400).json({
@@ -154,6 +208,17 @@ router.post('/register', function(req, res) {
   }
   if (['participant', 'organisateur'].indexOf(role) === -1) {
     return res.status(400).json({ success: false, message: 'Rôle invalide' });
+  }
+  if (rawEmail && !email.isValidEmail(rawEmail)) {
+    return res.status(400).json({ success: false, message: 'Email invalide' });
+  }
+  // Garde-fou : channel='email' impossible sans adresse.
+  if (channel === 'email' && !rawEmail) {
+    return res.status(400).json({
+      success: false,
+      code: 'EMAIL_REQUIRED',
+      message: 'Renseignez un email pour recevoir le code par email.',
+    });
   }
 
   // Si un user EXISTE déjà avec ce phone → bascule sur le flow login.
@@ -170,20 +235,28 @@ router.post('/register', function(req, res) {
 
       // Le user n'existe pas → on stocke en pending_registrations et on
       // envoie l'OTP. La création réelle attend la validation du code.
-      return issuePendingOtp({ phone: phone, nom: nom, prenom: prenom, role: role })
+      var pending = { phone: phone, nom: nom, prenom: prenom, role: role };
+      if (rawEmail) pending.email = rawEmail;
+      return issuePendingOtp(pending, channel)
         .then(function(extra) {
-          if (extra.sms_error) {
+          if (extra.delivery_error) {
+            var isEmail = extra.channel === 'email';
             return res.status(502).json({
               success: false,
-              code: 'SMS_DELIVERY_FAILED',
-              message: 'Le SMS n\'a pas pu être envoyé. Vérifie le numéro ou réessaie.',
+              code: isEmail ? 'EMAIL_DELIVERY_FAILED' : 'SMS_DELIVERY_FAILED',
+              message: isEmail
+                ? 'L\'email n\'a pas pu être envoyé. Vérifie l\'adresse ou réessaie en SMS.'
+                : 'Le SMS n\'a pas pu être envoyé. Vérifie le numéro ou réessaie.',
               phone: phone,
-              sms_error: extra.sms_error,
+              channel: extra.channel,
+              delivery_error: extra.delivery_error,
             });
           }
+          var via = extra.channel === 'email' ? 'email' : 'SMS';
           res.status(201).json(Object.assign({
             success: true,
-            message: 'Un code de vérification a été envoyé par SMS. Saisis-le pour activer ton compte.',
+            message: 'Un code de vérification a été envoyé par ' + via +
+              '. Saisis-le pour activer ton compte.',
             phone: phone,
             next: 'verify-otp',
           }, extra));
@@ -199,12 +272,19 @@ router.post('/register', function(req, res) {
 // @body {string} phone
 router.post('/login', function(req, res) {
   var phone = req.body.phone;
+  // Canal OTP demandé. Sans préférence explicite, issueOtp fallback sur
+  // user.last_otp_channel || 'sms' (sticky). Le mobile peut forcer 'email'
+  // depuis l'écran OTP (bouton "Pas reçu ? Recevoir par email").
+  var channel = normalizeChannel(req.body.channel);
 
   if (!phone) {
     return res.status(400).json({ success: false, message: 'Numéro de téléphone obligatoire' });
   }
 
-  pool.query('SELECT id, phone, role FROM users WHERE phone = $1', [phone])
+  pool.query(
+    'SELECT id, phone, role, email, last_otp_channel FROM users WHERE phone = $1',
+    [phone]
+  )
     .then(function(result) {
       if (result.rows.length === 0) {
         return res.status(404).json({
@@ -214,19 +294,35 @@ router.post('/login', function(req, res) {
       }
 
       var user = result.rows[0];
-      return issueOtp(user).then(function(extra) {
-        if (extra.sms_error) {
+
+      // Garde-fou : channel='email' demandé mais user sans email en base.
+      // Retour 400 explicite plutôt que tenter et logger EMAIL_REQUIRED.
+      if (channel === 'email' && !user.email) {
+        return res.status(400).json({
+          success: false,
+          code: 'EMAIL_NOT_SET',
+          message: 'Aucun email enregistré pour ce compte. Renseigne ton email dans le profil pour recevoir le code par email.',
+        });
+      }
+
+      return issueOtp(user, channel).then(function(extra) {
+        if (extra.delivery_error) {
+          var isEmail = extra.channel === 'email';
           return res.status(502).json({
             success: false,
-            code: 'SMS_DELIVERY_FAILED',
-            message: 'Le SMS n\'a pas pu être envoyé. Vérifie le numéro ou réessaie plus tard.',
+            code: isEmail ? 'EMAIL_DELIVERY_FAILED' : 'SMS_DELIVERY_FAILED',
+            message: isEmail
+              ? 'L\'email n\'a pas pu être envoyé. Réessaie ou bascule sur SMS.'
+              : 'Le SMS n\'a pas pu être envoyé. Vérifie le numéro ou réessaie plus tard.',
             phone: user.phone,
-            sms_error: extra.sms_error
+            channel: extra.channel,
+            delivery_error: extra.delivery_error,
           });
         }
+        var via = extra.channel === 'email' ? 'email' : 'SMS';
         res.json(Object.assign({
           success: true,
-          message: 'Code de vérification envoyé par SMS',
+          message: 'Code de vérification envoyé par ' + via,
           phone: user.phone,
           next: 'verify-otp'
         }, extra));
@@ -368,8 +464,8 @@ function acceptOtp(user, req, res) {
 // Appelé par /auth/verify-otp quand aucun user n'existe pour ce phone.
 function verifyPendingRegistration(phone, code, req, res) {
   return pool.query(
-    'SELECT phone, nom, prenom, role, otp_hash, otp_expires_at, otp_attempts, otp_locked_until ' +
-    'FROM pending_registrations WHERE phone = $1',
+    'SELECT phone, nom, prenom, role, email, otp_channel, otp_hash, otp_expires_at, ' +
+    'otp_attempts, otp_locked_until FROM pending_registrations WHERE phone = $1',
     [phone]
   ).then(function(pendingResult) {
     if (pendingResult.rows.length === 0) {
@@ -426,14 +522,18 @@ function verifyPendingRegistration(phone, code, req, res) {
       }
 
       // OTP VALIDÉ : promote pending → user. Génère referral_code, INSERT
-      // users, DELETE pending, retourne token. Trace REGISTER dans audit.
+      // users (avec email si fourni au signup), DELETE pending, retourne token.
+      // Trace REGISTER dans audit.
       return generateUniqueReferralCode()
         .catch(function() { return null; })
         .then(function(referralCode) {
           return pool.query(
-            'INSERT INTO users (nom, prenom, phone, role, referral_code, last_login_at) ' +
-            'VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id, nom, prenom, phone, role',
-            [pending.nom, pending.prenom, pending.phone, pending.role, referralCode]
+            'INSERT INTO users (nom, prenom, phone, role, email, last_otp_channel, ' +
+            'referral_code, last_login_at) ' +
+            'VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) ' +
+            'RETURNING id, nom, prenom, phone, role, email, last_otp_channel',
+            [pending.nom, pending.prenom, pending.phone, pending.role,
+              pending.email || null, pending.otp_channel || null, referralCode]
           );
         })
         .then(function(insRes) {
@@ -455,6 +555,7 @@ function verifyPendingRegistration(phone, code, req, res) {
               prenom: user.prenom,
               phone: user.phone,
               role: user.role,
+              email: user.email,
             },
             token: token,
           });
@@ -497,8 +598,8 @@ router.get('/me/activity', auth.authMiddleware, function(req, res) {
 // GET /auth/me — Récupère le profil de l'utilisateur connecté
 router.get('/me', auth.authMiddleware, function(req, res) {
   pool.query(
-    'SELECT id, nom, prenom, phone, role, preferences, ville, date_naissance, photo_url, ' +
-    'referral_code, points, created_at FROM users WHERE id = $1',
+    'SELECT id, nom, prenom, phone, email, last_otp_channel, role, preferences, ville, ' +
+    'date_naissance, photo_url, referral_code, points, created_at FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -521,6 +622,8 @@ router.get('/me', auth.authMiddleware, function(req, res) {
               nom: user.nom,
               prenom: user.prenom,
               phone: user.phone,
+              email: user.email,
+              last_otp_channel: user.last_otp_channel,
               role: user.role,
               preferences: user.preferences || {},
               ville: user.ville,
@@ -579,6 +682,23 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
     }
     sets.push('nom = $' + i++);
     values.push(n);
+  }
+
+  // Email : null pour effacer, string pour set/update. Stocké en lowercase
+  // pour éviter les doublons de casse. Sert au canal email du flow OTP.
+  if (input.email !== undefined) {
+    if (input.email === null || input.email === '') {
+      sets.push('email = NULL');
+    } else {
+      if (!email.isValidEmail(input.email)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email invalide.'
+        });
+      }
+      sets.push('email = $' + i++);
+      values.push(email.normalizeEmail(input.email));
+    }
   }
 
   if (input.ville !== undefined) {
@@ -670,7 +790,8 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
 
   pool.query(
     'UPDATE users SET ' + sets.join(', ') + ' WHERE id = $' + i +
-    ' RETURNING id, nom, prenom, phone, role, preferences, ville, date_naissance, photo_url, created_at',
+    ' RETURNING id, nom, prenom, phone, email, role, preferences, ville, date_naissance, ' +
+    'photo_url, created_at',
     values
   )
     .then(function(result) {
@@ -690,6 +811,7 @@ router.patch('/me', auth.authMiddleware, function(req, res) {
           nom: user.nom,
           prenom: user.prenom,
           phone: user.phone,
+          email: user.email,
           role: user.role,
           preferences: user.preferences || {},
           ville: user.ville,

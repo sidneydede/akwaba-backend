@@ -681,6 +681,22 @@ CREATE INDEX IF NOT EXISTS idx_pending_registrations_created ON pending_registra
 -- Si présente, la vidéo joue en hero (priorité sur image_url et défauts catégorie).\n\
 -- Validation Cloudinary tenant côté API (anti XSS/injection).\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS video_url TEXT;\n\
+\n\
+-- ============================================================\n\
+-- OTP-MULTICHANNEL : email comme canal alternatif au SMS\n\
+-- ============================================================\n\
+-- last_otp_channel : 'sms' | 'email'. Mémorise le canal du dernier OTP réussi\n\
+-- pour proposer le bon par défaut à la prochaine connexion (sticky channel).\n\
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_otp_channel VARCHAR(10);\n\
+\n\
+-- email dans pending_registrations : si l'user fournit son email au signup,\n\
+-- on le persiste ici pour le propager dans users.email après validation OTP.\n\
+ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS email VARCHAR(200);\n\
+\n\
+-- otp_channel dans pending : sticky preference dès le signup. Propagée vers\n\
+-- users.last_otp_channel à la promotion (sinon l'user qui s'inscrit en email\n\
+-- retomberait sur SMS par défaut au login suivant).\n\
+ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS otp_channel VARCHAR(10);\n\
 ";
 
 console.log('Migration en cours...');
