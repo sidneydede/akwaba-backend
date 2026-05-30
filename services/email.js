@@ -62,8 +62,15 @@ function buildOtpHtml(code) {
 function sendOtp(email, code) {
   var normalized = normalizeEmail(email);
 
-  // Mode dev : log dans la console et retourne success (parité avec sms.js)
+  // Mode dev : log dans la console et retourne success (parité avec sms.js).
+  // SAUF en prod : si RESEND_API_KEY est absent en prod, c'est une misconfig
+  // dangereuse — le mode dev mettrait dev_otp dans la réponse HTTP (leak).
+  // On préfère refuser explicitement et que le client affiche une erreur.
   if (!isRealEmailEnabled()) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[EMAIL] RESEND_API_KEY absent en prod — refus envoi pour ' + normalized);
+      return Promise.resolve({ success: false, error: 'EMAIL_NOT_CONFIGURED' });
+    }
     console.log('[EMAIL DEV] OTP pour ' + normalized + ' : ' + code);
     return Promise.resolve({ success: true, dev: true });
   }
