@@ -10,6 +10,7 @@ var auth = require('../middleware/auth');
 var push = require('../services/push');
 var cinetpay = require('../services/cinetpay');
 var followsRouter = require('./follows');
+var passwordPolicy = require('../services/passwordPolicy');
 
 // Rate-limit login admin — défense en profondeur (3 couches).
 //
@@ -291,6 +292,82 @@ router.get('/me', function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur GET /admin/me:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /admin/me/password — Self-service rotation du mot de passe admin.
+// L'admin doit fournir son mot de passe courant (re-auth) + le nouveau.
+// Côté sécurité : password_changed_at est bump → tous les tokens existants
+// (y compris celui qui sert cette requête) deviennent invalides à la prochaine
+// vérification middleware (cf. SEC M9 dans middleware/auth.js). Le front doit
+// donc rediriger vers /login après succès.
+// @body {string} currentPassword, newPassword
+router.patch('/me/password', function(req, res) {
+  var currentPassword = req.body.currentPassword || '';
+  var newPassword = req.body.newPassword || '';
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'Mot de passe actuel et nouveau mot de passe requis.'
+    });
+  }
+
+  // Pré-check trivial avant le coûteux scrypt verify : si new === current,
+  // ce n'est pas vraiment une rotation.
+  if (newPassword === currentPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'Le nouveau mot de passe doit être différent de l\'actuel.'
+    });
+  }
+
+  // Politique SEC M2 (12+ chars, complexité, anti-common, anti-self).
+  // Passe email + nom pour les checks contextuels.
+  var policyError = passwordPolicy.validate(newPassword, {
+    email: req.admin.email,
+    nom: req.admin.nom,
+  });
+  if (policyError) {
+    return res.status(400).json({ success: false, message: policyError });
+  }
+
+  // Re-fetch password_hash car req.admin n'inclut pas le hash (sécu).
+  pool.query('SELECT password_hash FROM users WHERE id = $1', [req.admin.id])
+    .then(function(result) {
+      if (result.rows.length === 0 || !result.rows[0].password_hash) {
+        return res.status(404).json({ success: false, message: 'Compte introuvable.' });
+      }
+      return auth.verifyPassword(currentPassword, result.rows[0].password_hash)
+        .then(function(ok) {
+          if (!ok) {
+            // Audit le fail : utile pour détecter une compromission du token
+            // (si quelqu'un a volé le cookie mais ignore le mdp courant).
+            logAudit(req.admin.id, 'admin.password_change_fail', 'user', req.admin.id, null);
+            return res.status(401).json({
+              success: false,
+              message: 'Mot de passe actuel incorrect.'
+            });
+          }
+          return auth.hashPassword(newPassword).then(function(newHash) {
+            return pool.query(
+              'UPDATE users SET password_hash = $1, password_changed_at = NOW(), ' +
+              'updated_at = NOW() WHERE id = $2',
+              [newHash, req.admin.id]
+            );
+          })
+            .then(function() {
+              logAudit(req.admin.id, 'admin.password_change', 'user', req.admin.id, null);
+              res.json({
+                success: true,
+                message: 'Mot de passe mis à jour. Reconnecte-toi avec le nouveau.',
+              });
+            });
+        });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /admin/me/password:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
