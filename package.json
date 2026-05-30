@@ -9,6 +9,7 @@
     "migrate": "node db/migrate.js",
     "seed": "node db/seed.js",
     "seed:admin": "node scripts/seed-admin.js",
+    "reset:admin": "node scripts/reset-admin-credentials.js",
     "setup": "node db/migrate.js && node db/seed.js"
   },
   "dependencies": {
