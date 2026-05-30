@@ -1,5 +1,16 @@
 // scripts/reset-admin-credentials.js — Reset email + password d'un compte admin existant
-// Usage: node scripts/reset-admin-credentials.js <currentEmail> <newEmail> <newPassword>
+// Usage:
+//   node scripts/reset-admin-credentials.js <currentEmail> <newEmail> [newPassword]
+//
+// Si <newPassword> est omis, le script en génère un crypto-random garanti sans
+// chars ambigus pour PowerShell/bash (que [a-zA-Z0-9] + suffixe "Aa2!").
+// L'affichage final montre le password généré 1 fois — copie-le immédiatement.
+//
+// Après UPDATE en DB, le script appelle le backend live (env AKWABA_BACKEND_URL
+// ou default prod) pour vérifier que le login fonctionne end-to-end. Si OK, la
+// DB sur laquelle on écrit ET le backend prod tapent bien sur la même base.
+// Si FAIL, on a un mismatch (typique : DATABASE_URL local pas alignée avec
+// celle utilisée par le service Render).
 //
 // Cas d'usage typique : un email seedé à l'époque pré-rebrand (@akwaba.app)
 // n'est pas une vraie mailbox réceptrice → bascule sur l'email réel de l'admin.
@@ -12,14 +23,12 @@
 //
 // Sécurité :
 // - password_changed_at = NOW() → invalide tous les tokens existants (SEC M9)
-// - Politique SEC M2 appliquée au nouveau password (12+ chars, complexité)
-// - Le password est en argv, pas en variable d'env → reste local au terminal
-//
-// Pour reset le compte PROD sans exposer DATABASE_URL en .env local :
-//   $env:DATABASE_URL="<render-prod-url>"; node scripts/reset-admin-credentials.js \
-//     ancien@email.com nouveau@email.com 'MotDePasseFort!2026'
+// - Politique SEC M2 appliquée au nouveau password
+// - Password généré in-process si non fourni → jamais en argv, jamais clipboard
+// - 2FA TOTP préservée (totp_secret non touché)
 
 require('dotenv').config();
+var crypto = require('crypto');
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var passwordPolicy = require('../services/passwordPolicy');
@@ -28,17 +37,29 @@ var args = process.argv.slice(2);
 var currentEmail = (args[0] || '').trim().toLowerCase();
 var newEmail = (args[1] || '').trim().toLowerCase();
 var newPassword = args[2] || '';
+var passwordGenerated = false;
 
-if (!currentEmail || !newEmail || !newPassword) {
-  console.error('Usage: node scripts/reset-admin-credentials.js <currentEmail> <newEmail> <newPassword>');
+if (!currentEmail || !newEmail) {
+  console.error('Usage: node scripts/reset-admin-credentials.js <currentEmail> <newEmail> [newPassword]');
+  console.error('Si <newPassword> omis : génère un password crypto-random safe pour shell.');
   process.exit(1);
 }
 if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
   console.error('Nouvel email invalide.');
   process.exit(1);
 }
-// Politique SEC M2 : valide la complexité du password. Passe newEmail en
-// contexte pour le check anti-self-leak (password contenant le local-part).
+
+function generateSafePassword() {
+  var alnum = crypto.randomBytes(18).toString('base64').replace(/[^a-zA-Z0-9]/g, '');
+  return alnum.slice(0, 16) + 'Aa2!';
+}
+
+if (!newPassword) {
+  newPassword = generateSafePassword();
+  passwordGenerated = true;
+}
+
+// Politique SEC M2 : valide la complexité (catch d'un password fourni faible).
 var policyError = passwordPolicy.validate(newPassword, { email: newEmail });
 if (policyError) {
   console.error('Password invalide : ' + policyError);
@@ -67,7 +88,7 @@ pool.query(
       return pool.query(
         'UPDATE users SET email = $1, phone = $2, password_hash = $3, ' +
         'password_changed_at = NOW(), updated_at = NOW() WHERE id = $4 ' +
-        'RETURNING id, email, role',
+        'RETURNING id, email',
         [newEmail, newFakePhone, passwordHash, adminId]
       );
     });
@@ -75,12 +96,39 @@ pool.query(
   .then(function(r) {
     var admin = r.rows[0];
     console.log('Admin mis à jour : id=' + admin.id + ', email=' + admin.email);
-    console.log('Tu peux maintenant te connecter avec :');
-    console.log('  email    : ' + admin.email);
-    console.log('  password : (celui que tu viens de fournir)');
-    console.log('NB : les tokens existants sont invalidés (SEC M9). Si tu avais 2FA setup,');
-    console.log('     elle reste active (totp_secret préservé).');
-    process.exit(0);
+    // Auto-verify end-to-end : appelle le backend live pour confirmer que la
+    // DB qu'on vient de modifier est bien celle utilisée par le service prod.
+    var backendUrl = process.env.AKWABA_BACKEND_URL || 'https://akwaba-backend.onrender.com';
+    console.log('Verif live contre ' + backendUrl + ' ...');
+    return fetch(backendUrl + '/admin/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: newEmail, password: newPassword })
+    })
+      .then(function(res) {
+        return res.json().then(function(data) { return { status: res.status, data: data }; });
+      })
+      .then(function(result) {
+        console.log('');
+        console.log('============================================================');
+        if (result.data && result.data.success) {
+          console.log('  END-TO-END OK : backend a accepte les nouveaux credentials.');
+        } else {
+          console.log('  END-TO-END FAIL : DB/backend pointent sur des bases differentes.');
+          console.log('  Status=' + result.status + ' Reponse=' + JSON.stringify(result.data));
+        }
+        console.log('============================================================');
+        if (passwordGenerated) {
+          console.log('');
+          console.log('NOUVEAU PASSWORD : ' + newPassword);
+          console.log('(Copie-le maintenant — pas reaffiche. Clear-Host apres usage.)');
+        }
+        console.log('');
+        console.log('Login : ' + backendUrl.replace('akwaba-backend.onrender.com', 'admin.event-next-door.com') + '/login');
+        console.log('Email : ' + newEmail);
+        console.log('NB : tokens existants invalides (SEC M9). 2FA TOTP preservee.');
+        process.exit(0);
+      });
   })
   .catch(function(err) {
     if (err.code === '23505') {
