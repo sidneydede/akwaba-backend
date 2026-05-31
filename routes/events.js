@@ -304,7 +304,7 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
   Promise.all([
     pool.query(
       'SELECT id, organizer_id, title, description, category, date, start_at, end_at, ' +
-      'lieu, prix, prix_display, emoji, color, chaud, image_url, ' +
+      'lieu, prix, prix_display, emoji, color, chaud, image_url, commission_rate, ' +
       'places_total, places_restantes, status, rejection_reason, created_at ' +
       'FROM events WHERE id = $1',
       [eventId]
@@ -317,6 +317,10 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
       'WHERE b.event_id = $1 ORDER BY b.created_at DESC',
       [eventId]
     ),
+    // UX audit P0#6 : recupere les taux de commission et frais CinetPay pour
+    // calculer le revenu net reel cote backend (la verite). Per-event override
+    // sur events.commission_rate prevaut sur le defaut global.
+    pool.query("SELECT key, value FROM app_settings WHERE key IN ('commission_rate', 'cinetpay_fee_rate')"),
   ])
     .then(function(results) {
       if (results[0].rows.length === 0) {
@@ -331,6 +335,16 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
       }
 
       var bookings = results[1].rows;
+      // P0#6 : taux effectifs. Per-event override sur ev.commission_rate prend
+      // precedence sur la valeur globale d'app_settings.
+      var settingsMap = {};
+      results[2].rows.forEach(function(r) { settingsMap[r.key] = parseFloat(r.value); });
+      var globalCommissionRate = isNaN(settingsMap.commission_rate) ? 0.06 : settingsMap.commission_rate;
+      var cinetpayFeeRate = isNaN(settingsMap.cinetpay_fee_rate) ? 0.015 : settingsMap.cinetpay_fee_rate;
+      var effectiveCommissionRate = (ev.commission_rate !== null && ev.commission_rate !== undefined)
+        ? parseFloat(ev.commission_rate)
+        : globalCommissionRate;
+
       var stats = {
         bookings_total: bookings.length,
         bookings_confirme: 0,
@@ -341,6 +355,12 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
         revenue_brut: 0,          // sum total_amount confirmed
         billets_scannes: 0,       // sum quantity used
         refund_total: 0,          // sum refund_amount on cancelled
+        // P0#6 : deductions explicites pour transparence B2B
+        commission_rate: effectiveCommissionRate,
+        cinetpay_fee_rate: cinetpayFeeRate,
+        commission_total: 0,      // commission Akwaba sur revenue_brut
+        cinetpay_fees_total: 0,   // frais CinetPay sur revenue_brut
+        revenue_net: 0,           // revenue_brut - commission - cinetpay - refunds
       };
       bookings.forEach(function(b) {
         if (b.statut === 'confirme') {
@@ -359,6 +379,10 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
           stats.refund_total += parseInt(b.refund_amount) || 0;
         }
       });
+      // Calculs deductions arrondis a l'entier (FCFA n'a pas de centimes)
+      stats.commission_total = Math.round(stats.revenue_brut * effectiveCommissionRate);
+      stats.cinetpay_fees_total = Math.round(stats.revenue_brut * cinetpayFeeRate);
+      stats.revenue_net = stats.revenue_brut - stats.commission_total - stats.cinetpay_fees_total - stats.refund_total;
 
       res.json({
         success: true,
@@ -538,15 +562,35 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
 
   // start_at / end_at (TIMESTAMP) : nécessaires pour les calculs J+2 escrow,
   // refund 48h/24h, et rappels push. Optionnels — la string `date` reste affichée.
+  // UX audit orga P0#5 : refuser une date dans le passé (form + sécurité backend).
+  // Tolérance 5 min pour absorber le délai entre saisie et POST (horloges, latence).
   var startAt = null;
   if (body.start_at) {
     var d = new Date(body.start_at);
-    if (!isNaN(d.getTime())) startAt = d;
+    if (!isNaN(d.getTime())) {
+      if (d.getTime() < Date.now() - 5 * 60 * 1000) {
+        return res.status(400).json({
+          success: false,
+          code: 'start_at_in_past',
+          message: 'La date de l\'événement doit être dans le futur.',
+        });
+      }
+      startAt = d;
+    }
   }
   var endAt = null;
   if (body.end_at) {
     var de = new Date(body.end_at);
-    if (!isNaN(de.getTime())) endAt = de;
+    if (!isNaN(de.getTime())) {
+      if (startAt && de.getTime() <= startAt.getTime()) {
+        return res.status(400).json({
+          success: false,
+          code: 'end_at_before_start',
+          message: 'La date de fin doit être après la date de début.',
+        });
+      }
+      endAt = de;
+    }
   }
 
   // EVENT-VIDEO : whitelist Cloudinary tenant pour video_url (anti XSS).
@@ -668,15 +712,37 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
       }
 
       // Parse start_at / end_at si fournis (sinon COALESCE garde l'ancienne valeur).
+      // UX audit orga P0#5 : meme validation que POST — refuser date passee.
+      // Tolerance speciale en edit : si l'event a deja eu lieu, on ne re-bloque pas
+      // (l'orga peut vouloir corriger un titre/description sur un event passe).
+      // On bloque uniquement quand l'orga essaie de DEPLACER vers le passe.
       var newStartAt = null;
       if (body.start_at) {
         var ds = new Date(body.start_at);
-        if (!isNaN(ds.getTime())) newStartAt = ds;
+        if (!isNaN(ds.getTime())) {
+          if (ds.getTime() < Date.now() - 5 * 60 * 1000) {
+            return res.status(400).json({
+              success: false,
+              code: 'start_at_in_past',
+              message: 'La date de l\'événement doit être dans le futur.',
+            });
+          }
+          newStartAt = ds;
+        }
       }
       var newEndAt = null;
       if (body.end_at) {
         var dee = new Date(body.end_at);
-        if (!isNaN(dee.getTime())) newEndAt = dee;
+        if (!isNaN(dee.getTime())) {
+          if (newStartAt && dee.getTime() <= newStartAt.getTime()) {
+            return res.status(400).json({
+              success: false,
+              code: 'end_at_before_start',
+              message: 'La date de fin doit être après la date de début.',
+            });
+          }
+          newEndAt = dee;
+        }
       }
 
       // EVENT-VIDEO : valide video_url contre tenant Cloudinary.

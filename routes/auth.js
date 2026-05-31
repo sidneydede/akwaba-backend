@@ -599,7 +599,8 @@ router.get('/me/activity', auth.authMiddleware, function(req, res) {
 router.get('/me', auth.authMiddleware, function(req, res) {
   pool.query(
     'SELECT id, nom, prenom, phone, email, last_otp_channel, role, preferences, ville, ' +
-    'date_naissance, photo_url, referral_code, points, created_at FROM users WHERE id = $1',
+    'date_naissance, photo_url, referral_code, points, payout_account, kyc_status, ' +
+    'created_at FROM users WHERE id = $1',
     [req.userId]
   )
     .then(function(result) {
@@ -631,6 +632,10 @@ router.get('/me', auth.authMiddleware, function(req, res) {
               photo_url: user.photo_url,
               referral_code: user.referral_code,
               points: user.points || 0,
+              // Self-service orga : status KYC + compte de reversement
+              // exposés (P0#2 + P0#3 audit orga).
+              kyc_status: user.kyc_status || 'none',
+              payout_account: user.payout_account || null,
               created_at: user.created_at
             },
             stats: {
@@ -867,6 +872,107 @@ router.post('/me/photo-signature', auth.authMiddleware, function(req, res) {
   });
 });
 
+// POST /auth/me/kyc/signature — Signature Cloudinary pour upload des documents
+// KYC (CNI/passeport + justif activité). Restreint aux organisateurs.
+// Folder dedie kyc/<user_id>/ pour cleanup facile + isolation des assets sensibles.
+// UX audit orga P0#2 : self-service KYC, avant tout etait admin-only.
+router.post('/me/kyc/signature', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var crypto = require('crypto');
+  var apiKey = process.env.CLOUDINARY_API_KEY;
+  var apiSecret = process.env.CLOUDINARY_API_SECRET;
+  var cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+
+  if (!apiKey || !apiSecret || !cloudName) {
+    return res.status(503).json({
+      success: false,
+      message: 'Cloudinary non configuré côté serveur',
+    });
+  }
+
+  var folder = 'akwaba/kyc/' + req.userId;
+  var timestamp = Math.floor(Date.now() / 1000);
+  // Pas de transformation : on garde le doc tel quel pour la review admin.
+  var paramsToSign = 'folder=' + folder + '&timestamp=' + timestamp;
+  var signature = crypto.createHash('sha1').update(paramsToSign + apiSecret).digest('hex');
+
+  res.json({
+    success: true,
+    signature: signature,
+    timestamp: timestamp,
+    api_key: apiKey,
+    cloud_name: cloudName,
+    folder: folder,
+    upload_url: 'https://api.cloudinary.com/v1_1/' + cloudName + '/image/upload',
+  });
+});
+
+// POST /auth/me/kyc/submit — Soumet les documents KYC pour review admin.
+// @body {object} { id_document: secureUrl, activity_proof: secureUrl }
+// Valide que les 2 URLs sont Cloudinary tenant + folder kyc/<self user_id>.
+// Bumps kyc_status -> 'pending', stamp kyc_submitted_at, write audit log.
+router.post('/me/kyc/submit', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var body = req.body || {};
+  var idDoc = String(body.id_document || '').trim();
+  var actDoc = String(body.activity_proof || '').trim();
+
+  if (!idDoc || !actDoc) {
+    return res.status(400).json({
+      success: false,
+      message: 'Pièce d\'identité ET justificatif d\'activité requis.',
+    });
+  }
+
+  // Validation tenant + ownership : l'URL doit pointer sur Cloudinary du
+  // tenant configure ET sur le folder kyc/<user_id> (anti-injection : empeche
+  // un user de soumettre des URLs pointant sur les KYC d'un autre).
+  var cloudName = process.env.CLOUDINARY_CLOUD_NAME || '';
+  var expectedPrefix = cloudName
+    ? 'https://res.cloudinary.com/' + cloudName + '/'
+    : null;
+  var ownerFragment = '/akwaba/kyc/' + req.userId + '/';
+
+  function validUrl(url) {
+    if (!expectedPrefix) return false;
+    if (url.indexOf(expectedPrefix) !== 0) return false;
+    if (url.indexOf(ownerFragment) === -1) return false;
+    if (url.length > 500) return false;
+    return true;
+  }
+
+  if (!validUrl(idDoc) || !validUrl(actDoc)) {
+    return res.status(400).json({
+      success: false,
+      message: 'URLs invalides (doivent être des uploads Cloudinary du tenant Akwaba).',
+    });
+  }
+
+  var docs = {
+    id_document: idDoc,
+    activity_proof: actDoc,
+    submitted_at: new Date().toISOString(),
+  };
+
+  pool.query(
+    "UPDATE users SET kyc_documents = $1::jsonb, kyc_status = 'pending', " +
+    'kyc_submitted_at = NOW(), kyc_rejection_reason = NULL, updated_at = NOW() ' +
+    'WHERE id = $2 RETURNING kyc_status, kyc_submitted_at',
+    [JSON.stringify(docs), req.userId]
+  )
+    .then(function(r) {
+      userAudit.log(req.userId, 'kyc.submit', req, { docs_count: 2 });
+      res.json({
+        success: true,
+        kyc_status: r.rows[0].kyc_status,
+        kyc_submitted_at: r.rows[0].kyc_submitted_at,
+        message: 'Documents reçus. Review sous 24h ouvrées — tu seras notifié.',
+      });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /auth/me/kyc/submit:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // PATCH /auth/me/preferences — Met à jour les préférences de l'utilisateur connecté.
 // @body {object} preferences - { categories?: string[], lang?: string }
 // On merge avec l'existant pour ne pas écraser les autres clés.
@@ -897,6 +1003,101 @@ router.patch('/me/preferences', auth.authMiddleware, function(req, res) {
     })
     .catch(function(err) {
       console.error('Erreur PATCH /auth/me/preferences:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
+// PATCH /auth/me/payout-account — Self-service config du compte de reversement.
+// UX audit orga P0#3 : avant, seul l'admin pouvait set payout_account via
+// /admin/users/:id/payout-account — bloquant pour un orga qui veut s'auto-onboarder.
+//
+// @body {object} Payload selon provider :
+//   - Mobile Money : { provider: 'orange_money'|'mtn_momo'|'wave', number, name }
+//   - Bancaire     : { provider: 'bank', bank_name, iban, name }
+// Pour vider : { provider: null } ou body vide.
+//
+// Validation stricte par provider. Mobile Money : numero CI normalise. Bank :
+// IBAN basique (juste format, pas check digit). Nom titulaire toujours requis.
+router.patch('/me/payout-account', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var body = req.body || {};
+  // Effacer le compte (provider null/missing avec payload vide)
+  if (body.provider === null || (Object.keys(body).length === 0)) {
+    return pool.query(
+      'UPDATE users SET payout_account = NULL, updated_at = NOW() WHERE id = $1',
+      [req.userId]
+    )
+      .then(function() {
+        res.json({ success: true, payout_account: null });
+      })
+      .catch(function(err) {
+        console.error('Erreur PATCH /auth/me/payout-account (clear):', err.message);
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+      });
+  }
+
+  var provider = String(body.provider || '').trim().toLowerCase();
+  var allowedProviders = ['orange_money', 'mtn_momo', 'wave', 'bank'];
+  if (allowedProviders.indexOf(provider) === -1) {
+    return res.status(400).json({
+      success: false,
+      message: 'Provider invalide (orange_money, mtn_momo, wave, bank).',
+    });
+  }
+
+  var name = String(body.name || '').trim();
+  if (!name || name.length < 2 || name.length > 100) {
+    return res.status(400).json({
+      success: false,
+      message: 'Nom du titulaire requis (2 à 100 caractères).',
+    });
+  }
+
+  var account = { provider: provider, name: name };
+
+  if (provider === 'bank') {
+    var bankName = String(body.bank_name || '').trim();
+    var iban = String(body.iban || '').trim().replace(/\s+/g, '').toUpperCase();
+    if (!bankName || bankName.length > 80) {
+      return res.status(400).json({
+        success: false,
+        message: 'Nom de la banque requis (max 80 caractères).',
+      });
+    }
+    if (!/^[A-Z0-9]{15,34}$/.test(iban)) {
+      return res.status(400).json({
+        success: false,
+        message: 'IBAN invalide (15-34 caractères alphanumériques).',
+      });
+    }
+    account.bank_name = bankName;
+    account.iban = iban;
+  } else {
+    // Mobile money : numéro CI 10 chiffres (07/05/01...) ou format international.
+    var rawNumber = String(body.number || '').trim().replace(/\s+/g, '');
+    var digits = rawNumber.replace(/^\+/, '').replace(/^225/, '');
+    if (!/^(0[1579])\d{8}$/.test(digits)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Numéro Mobile Money invalide (10 chiffres CI commençant par 01, 05, 07 ou 09).',
+      });
+    }
+    account.number = '+225' + digits;
+  }
+
+  pool.query(
+    'UPDATE users SET payout_account = $1::jsonb, updated_at = NOW() WHERE id = $2 RETURNING payout_account',
+    [JSON.stringify(account), req.userId]
+  )
+    .then(function(r) {
+      // Audit minimal : provider + nom titulaire (pas le numéro complet, masqué dans logs).
+      userAudit.log(req.userId, 'payout.update', req, {
+        provider: provider,
+        masked_dest: provider === 'bank' ? (account.iban || '').slice(-4) : (account.number || '').slice(-4),
+      });
+      res.json({ success: true, payout_account: r.rows[0].payout_account });
+    })
+    .catch(function(err) {
+      console.error('Erreur PATCH /auth/me/payout-account:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
 });
