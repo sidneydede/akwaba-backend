@@ -22,6 +22,25 @@ function fetchEventTickets(eventId) {
   });
 }
 
+// Batch fetch : retourne { eventId: [tickets] } pour la liste d'IDs fournie.
+// Utilise par les GET / et /recommended pour eviter N+1 queries.
+function fetchTicketsByEventIds(eventIds) {
+  if (!eventIds || eventIds.length === 0) return Promise.resolve({});
+  return pool.query(
+    'SELECT id, event_id, name, price, places_total, places_restantes, sort_order ' +
+    'FROM event_tickets WHERE event_id = ANY($1::int[]) AND archived_at IS NULL ' +
+    'ORDER BY sort_order ASC, id ASC',
+    [eventIds]
+  ).then(function(r) {
+    var byEvent = {};
+    r.rows.forEach(function(row) {
+      if (!byEvent[row.event_id]) byEvent[row.event_id] = [];
+      byEvent[row.event_id].push(formatTicket(row));
+    });
+    return byEvent;
+  });
+}
+
 function formatTicket(row) {
   return {
     id: row.id.toString(),
@@ -223,39 +242,44 @@ router.get('/', function(req, res) {
 
   pool.query(sql, params)
     .then(function(result) {
-      var events = result.rows.map(function(row) {
-        var ev = {
-          id: row.id.toString(),
-          title: row.title,
-          description: row.description,
-          category: row.category,
-          date: row.date,
-          lieu: row.lieu,
-          prix: row.prix_display,
-          prix_num: row.prix,
-          emoji: row.emoji,
-          color: row.color,
-          chaud: row.chaud,
-          image_url: row.image_url,
-          places_total: row.places_total,
-          places_restantes: row.places_restantes,
-          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
-          // Alias lat/lng pour cohérence avec /favorites et le client mobile
-          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
-          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
-          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
-          organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
-          organisateur_prenom: row.organisateur_prenom || null,
-          organisateur_nom: row.organisateur_nom || null,
-        };
-        if (row.distance_km !== undefined && row.distance_km !== null) {
-          ev.distance_km = parseFloat(row.distance_km);
-        }
-        return ev;
+      var rows = result.rows;
+      var ids = rows.map(function(r) { return r.id; });
+      return fetchTicketsByEventIds(ids).then(function(ticketsByEvent) {
+        var events = rows.map(function(row) {
+          var ev = {
+            id: row.id.toString(),
+            title: row.title,
+            description: row.description,
+            category: row.category,
+            date: row.date,
+            lieu: row.lieu,
+            prix: row.prix_display,
+            prix_num: row.prix,
+            emoji: row.emoji,
+            color: row.color,
+            chaud: row.chaud,
+            image_url: row.image_url,
+            places_total: row.places_total,
+            places_restantes: row.places_restantes,
+            latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+            longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+            // Alias lat/lng pour cohérence avec /favorites et le client mobile
+            // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+            lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+            lng: row.longitude !== null ? parseFloat(row.longitude) : null,
+            organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
+            organisateur_prenom: row.organisateur_prenom || null,
+            organisateur_nom: row.organisateur_nom || null,
+            // P0#4 mobile : tickets pour le picker EventScreen.
+            tickets: ticketsByEvent[row.id] || [],
+          };
+          if (row.distance_km !== undefined && row.distance_km !== null) {
+            ev.distance_km = parseFloat(row.distance_km);
+          }
+          return ev;
+        });
+        res.json({ success: true, events: events });
       });
-
-      res.json({ success: true, events: events });
     })
     .catch(function(err) {
       console.error('Erreur GET /events:', err.message, '\n  code:', err && err.code);
@@ -336,38 +360,44 @@ router.get('/recommended', function(req, res) {
       return pool.query(sql, params);
     })
     .then(function(result) {
-      var events = result.rows.map(function(row) {
-        return {
-          id: row.id.toString(),
-          title: row.title,
-          description: row.description,
-          category: row.category,
-          date: row.date,
-          lieu: row.lieu,
-          prix: row.prix_display,
-          prix_num: row.prix,
-          emoji: row.emoji,
-          color: row.color,
-          chaud: row.chaud,
-          image_url: row.image_url,
-          places_total: row.places_total,
-          places_restantes: row.places_restantes,
-          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
-          // Alias lat/lng pour cohérence avec /favorites et le client mobile
-          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
-          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
-          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
-          organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
-          organisateur_prenom: row.organisateur_prenom || null,
-          organisateur_nom: row.organisateur_nom || null,
-          popularity: row.popularity || 0,
-        };
-      });
-      res.json({
-        success: true,
-        events: events,
-        personalized: prefCategories.length > 0,
+      var rows = result.rows;
+      var ids = rows.map(function(r) { return r.id; });
+      return fetchTicketsByEventIds(ids).then(function(ticketsByEvent) {
+        var events = rows.map(function(row) {
+          return {
+            id: row.id.toString(),
+            title: row.title,
+            description: row.description,
+            category: row.category,
+            date: row.date,
+            lieu: row.lieu,
+            prix: row.prix_display,
+            prix_num: row.prix,
+            emoji: row.emoji,
+            color: row.color,
+            chaud: row.chaud,
+            image_url: row.image_url,
+            places_total: row.places_total,
+            places_restantes: row.places_restantes,
+            latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+            longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+            // Alias lat/lng pour cohérence avec /favorites et le client mobile
+            // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+            lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+            lng: row.longitude !== null ? parseFloat(row.longitude) : null,
+            organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
+            organisateur_prenom: row.organisateur_prenom || null,
+            organisateur_nom: row.organisateur_nom || null,
+            popularity: row.popularity || 0,
+            // P0#4 mobile : tickets exposes pour le picker EventScreen.
+            tickets: ticketsByEvent[row.id] || [],
+          };
+        });
+        res.json({
+          success: true,
+          events: events,
+          personalized: prefCategories.length > 0,
+        });
       });
     })
     .catch(function(err) {
@@ -637,12 +667,18 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
 
 // GET /events/:id — Détail d'un événement (avec orga via LEFT JOIN, FOLLOW-01)
 router.get('/:id', function(req, res) {
-  pool.query(
-    'SELECT e.*, u.id AS organisateur_id, u.prenom AS organisateur_prenom, u.nom AS organisateur_nom ' +
-    'FROM events e LEFT JOIN users u ON u.id = e.organizer_id WHERE e.id = $1',
-    [req.params.id]
-  )
-    .then(function(result) {
+  Promise.all([
+    pool.query(
+      'SELECT e.*, u.id AS organisateur_id, u.prenom AS organisateur_prenom, u.nom AS organisateur_nom ' +
+      'FROM events e LEFT JOIN users u ON u.id = e.organizer_id WHERE e.id = $1',
+      [req.params.id]
+    ),
+    // P0#4 mobile : expose les tickets du detail event pour le picker cote client.
+    fetchEventTickets(req.params.id),
+  ])
+    .then(function(results) {
+      var result = results[0];
+      var tickets = results[1];
       if (result.rows.length === 0) {
         return res.status(404).json({ success: false, message: 'Événement non trouvé' });
       }
@@ -675,6 +711,7 @@ router.get('/:id', function(req, res) {
           organisateur_id: row.organisateur_id ? row.organisateur_id.toString() : null,
           organisateur_prenom: row.organisateur_prenom || null,
           organisateur_nom: row.organisateur_nom || null,
+          tickets: tickets,
         }
       });
     })
