@@ -78,15 +78,27 @@ router.post('/', auth.authMiddleware, function(req, res) {
     });
   }
 
-  // Récupère l'événement pour vérifier les places, le prix, et la fermeture
-  // des ventes (sales_close_at, P1#10 audit orga). start_at sert de fallback :
-  // si pas de sales_close_at programme, on refuse au-dela du debut de l'event.
-  pool.query(
-    'SELECT id, title, prix, prix_display, places_restantes, start_at, sales_close_at ' +
-    'FROM events WHERE id = $1',
-    [eventId]
-  )
-    .then(function(eventResult) {
+  // P0#4 audit : ticket_id explicite (multi-tickets). Si absent, fallback au
+  // 1er ticket non-archive du event (sort_order ASC) — preserve la rétrocompat
+  // pour les clients legacy (ancien mobile) qui ne envoient que eventId.
+  var explicitTicketId = req.body.ticket_id ? parseInt(req.body.ticket_id, 10) : null;
+
+  Promise.all([
+    pool.query(
+      'SELECT id, title, prix, prix_display, places_restantes, start_at, sales_close_at ' +
+      'FROM events WHERE id = $1',
+      [eventId]
+    ),
+    pool.query(
+      'SELECT id, name, price, places_total, places_restantes ' +
+      'FROM event_tickets WHERE event_id = $1 AND archived_at IS NULL ' +
+      'ORDER BY sort_order ASC, id ASC',
+      [eventId]
+    ),
+  ])
+    .then(function(results) {
+      var eventResult = results[0];
+      var ticketsResult = results[1];
       if (eventResult.rows.length === 0) {
         return res.status(404).json({
           success: false,
@@ -112,31 +124,62 @@ router.post('/', auth.authMiddleware, function(req, res) {
         });
       }
 
-      if (event.places_restantes < quantity) {
+      // P0#4 : selectionne le ticket cible.
+      var availableTickets = ticketsResult.rows;
+      if (availableTickets.length === 0) {
+        // Tres anciens events pre-migration (improbable apres backfill). Refuse.
         return res.status(400).json({
           success: false,
-          message: 'Plus assez de places disponibles'
+          message: 'Cet événement n\'a pas de catégorie de places configurée.',
+        });
+      }
+      var ticket;
+      if (explicitTicketId) {
+        ticket = availableTickets.filter(function(t) { return t.id === explicitTicketId; })[0];
+        if (!ticket) {
+          return res.status(400).json({
+            success: false,
+            code: 'ticket_not_found',
+            message: 'Cette catégorie de place n\'existe plus pour cet événement.',
+          });
+        }
+      } else {
+        ticket = availableTickets[0]; // fallback : 1er ticket (sort_order ASC).
+      }
+
+      if (ticket.places_restantes < quantity) {
+        return res.status(400).json({
+          success: false,
+          code: 'sold_out',
+          message: 'Plus assez de places dans la catégorie « ' + ticket.name + ' ».',
         });
       }
 
       var ref = generateRef();
-      var totalAmount = event.prix * quantity;
+      var totalAmount = ticket.price * quantity;
 
       // Crée la réservation en 'en_attente' (transaction_id = ref pour le tracking CinetPay)
       return pool.query(
-        "INSERT INTO bookings (user_id, event_id, ref, quantity, total_amount, paiement_method, statut, transaction_id) " +
-        "VALUES ($1, $2, $3, $4, $5, $6, 'en_attente', $3) RETURNING *",
-        [req.userId, eventId, ref, quantity, totalAmount, paiement]
+        "INSERT INTO bookings (user_id, event_id, ticket_id, ref, quantity, total_amount, paiement_method, statut, transaction_id) " +
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, 'en_attente', $4) RETURNING *",
+        [req.userId, eventId, ticket.id, ref, quantity, totalAmount, paiement]
       )
         .then(function(bookingResult) {
           var booking = bookingResult.rows[0];
 
-          // Décrémente les places restantes (soft-lock — sera relâché si paiement échoue
-          // via le job de réconciliation cinetpay)
+          // P0#4 : decremente places sur LE TICKET specifique + sur events
+          // (le total events.places_restantes reste coherent pour les queries legacy).
           return pool.query(
-            'UPDATE events SET places_restantes = places_restantes - $1 WHERE id = $2',
-            [quantity, eventId]
+            'UPDATE event_tickets SET places_restantes = places_restantes - $1, updated_at = NOW() ' +
+            'WHERE id = $2',
+            [quantity, ticket.id]
           )
+            .then(function() {
+              return pool.query(
+                'UPDATE events SET places_restantes = places_restantes - $1 WHERE id = $2',
+                [quantity, eventId]
+              );
+            })
             .then(function() {
               // Récupère les infos user pour CinetPay
               return pool.query('SELECT id, nom, prenom, phone FROM users WHERE id = $1', [req.userId]);
@@ -201,6 +244,14 @@ router.post('/', auth.authMiddleware, function(req, res) {
                       "UPDATE bookings SET statut = 'annule', updated_at = NOW() WHERE id = $1",
                       [booking.id]
                     )
+                      .then(function() {
+                        // P0#4 : libere places sur ticket ET events.
+                        return pool.query(
+                          'UPDATE event_tickets SET places_restantes = places_restantes + $1, updated_at = NOW() ' +
+                          'WHERE id = $2',
+                          [quantity, ticket.id]
+                        );
+                      })
                       .then(function() {
                         return pool.query(
                           'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',
@@ -622,7 +673,7 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
   var reason = (req.body.reason || '').trim();
 
   pool.query(
-    'SELECT b.id, b.user_id, b.event_id, b.quantity, b.total_amount, b.statut, ' +
+    'SELECT b.id, b.user_id, b.event_id, b.ticket_id, b.quantity, b.total_amount, b.statut, ' +
     'e.title, e.start_at, e.organizer_id ' +
     'FROM bookings b JOIN events e ON e.id = b.event_id ' +
     'WHERE b.id = $1',
@@ -683,6 +734,16 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
           'refund_status = $5, updated_at = NOW() WHERE id = $4 RETURNING id',
           [refundAmount, ratio, reason || null, bookingId, initialRefundStatus]
         )
+          .then(function() {
+            // P0#4 : libere la place sur LE TICKET specifique (si ticket_id present)
+            if (b.ticket_id) {
+              return pool.query(
+                'UPDATE event_tickets SET places_restantes = places_restantes + $1, updated_at = NOW() ' +
+                'WHERE id = $2',
+                [b.quantity, b.ticket_id]
+              );
+            }
+          })
           .then(function() {
             return pool.query(
               'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',
@@ -776,7 +837,7 @@ router.post('/:id/refund-orga', auth.authMiddleware, auth.requireOrganizer, func
 
   // Fetch booking + event (avec organizer_id pour verif ownership).
   pool.query(
-    'SELECT b.id, b.user_id, b.event_id, b.quantity, b.total_amount, b.statut, ' +
+    'SELECT b.id, b.user_id, b.event_id, b.ticket_id, b.quantity, b.total_amount, b.statut, ' +
     'b.refund_status, b.ref, e.title, e.organizer_id ' +
     'FROM bookings b JOIN events e ON e.id = b.event_id ' +
     'WHERE b.id = $1',
@@ -814,6 +875,16 @@ router.post('/:id/refund-orga', auth.authMiddleware, auth.requireOrganizer, func
         "refund_status = 'pending', updated_at = NOW() WHERE id = $4 RETURNING id",
         [amount, ratio, 'Refund orga : ' + reason, bookingId]
       )
+        .then(function() {
+          // P0#4 : libere la place sur le ticket specifique en + de events.
+          if (b.ticket_id) {
+            return pool.query(
+              'UPDATE event_tickets SET places_restantes = places_restantes + $1, updated_at = NOW() ' +
+              'WHERE id = $2',
+              [b.quantity, b.ticket_id]
+            );
+          }
+        })
         .then(function() {
           return pool.query(
             'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',

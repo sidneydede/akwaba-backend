@@ -702,6 +702,45 @@ ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS email VARCHAR(200);\n
 -- users.last_otp_channel à la promotion (sinon l'user qui s'inscrit en email\n\
 -- retomberait sur SMS par défaut au login suivant).\n\
 ALTER TABLE pending_registrations ADD COLUMN IF NOT EXISTS otp_channel VARCHAR(10);\n\
+\n\
+-- ============================================================\n\
+-- TICKETS-MULTI : categories de places par event (P0#4 audit orga)\n\
+-- ============================================================\n\
+-- Un event peut avoir N tickets (Standard / VIP / Early bird / etc.). Le\n\
+-- field events.prix devient legacy (= prix du 1er ticket) — il reste rempli\n\
+-- pour rétrocompat mais la verite vit dans event_tickets.\n\
+CREATE TABLE IF NOT EXISTS event_tickets (\n\
+  id SERIAL PRIMARY KEY,\n\
+  event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,\n\
+  name VARCHAR(80) NOT NULL,\n\
+  price INTEGER NOT NULL DEFAULT 0,\n\
+  places_total INTEGER NOT NULL DEFAULT 0,\n\
+  places_restantes INTEGER NOT NULL DEFAULT 0,\n\
+  sort_order INTEGER NOT NULL DEFAULT 0,\n\
+  archived_at TIMESTAMP,\n\
+  created_at TIMESTAMP DEFAULT NOW(),\n\
+  updated_at TIMESTAMP DEFAULT NOW()\n\
+);\n\
+CREATE INDEX IF NOT EXISTS idx_event_tickets_event ON event_tickets(event_id, sort_order);\n\
+\n\
+-- Migration legacy : pour chaque event sans tickets, on cree un ticket\n\
+-- 'Standard' avec prix et places hérités d'events. Idempotent : NOT EXISTS.\n\
+INSERT INTO event_tickets (event_id, name, price, places_total, places_restantes, sort_order)\n\
+SELECT id, 'Standard', COALESCE(prix, 0), COALESCE(places_total, 0), COALESCE(places_restantes, 0), 0\n\
+FROM events\n\
+WHERE NOT EXISTS (SELECT 1 FROM event_tickets WHERE event_id = events.id);\n\
+\n\
+-- bookings.ticket_id : rattache chaque booking à un ticket precis. NULL pour\n\
+-- les bookings tres anciens (pre-migration) qu'on rattache au 1er ticket de\n\
+-- leur event.\n\
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ticket_id INTEGER REFERENCES event_tickets(id);\n\
+CREATE INDEX IF NOT EXISTS idx_bookings_ticket ON bookings(ticket_id);\n\
+\n\
+-- Backfill : pour les bookings legacy sans ticket_id, on les rattache au\n\
+-- ticket Standard de leur event (le MIN(id) qu'on vient de creer ci-dessus).\n\
+UPDATE bookings SET ticket_id = (\n\
+  SELECT MIN(id) FROM event_tickets WHERE event_id = bookings.event_id\n\
+) WHERE ticket_id IS NULL;\n\
 ";
 
 console.log('Migration en cours...');

@@ -6,6 +6,154 @@ var router = express.Router();
 var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 
+// ─── Helpers multi-tickets (P0#4 audit orga) ─────────────────────────
+// Categories de places par event. La verite vit dans event_tickets ; events.prix
+// devient une derived display value (= prix min des tickets non-archives).
+
+// Fetch les tickets non archives d'un event. Tri par sort_order ASC, id ASC.
+function fetchEventTickets(eventId) {
+  return pool.query(
+    'SELECT id, event_id, name, price, places_total, places_restantes, sort_order, archived_at, created_at, updated_at ' +
+    'FROM event_tickets WHERE event_id = $1 AND archived_at IS NULL ' +
+    'ORDER BY sort_order ASC, id ASC',
+    [eventId]
+  ).then(function(r) {
+    return r.rows.map(formatTicket);
+  });
+}
+
+function formatTicket(row) {
+  return {
+    id: row.id.toString(),
+    name: row.name,
+    price: parseInt(row.price) || 0,
+    price_display: (parseInt(row.price) || 0) > 0
+      ? ((parseInt(row.price) || 0).toLocaleString('fr-FR') + ' FCFA')
+      : 'Gratuit',
+    places_total: parseInt(row.places_total) || 0,
+    places_restantes: parseInt(row.places_restantes) || 0,
+    sort_order: parseInt(row.sort_order) || 0,
+  };
+}
+
+// Calcule la display string pour un array de tickets :
+//   - 1 ticket > 0 : "5 000 FCFA"
+//   - 1 ticket = 0 : "Gratuit"
+//   - N tickets, min == max : "5 000 FCFA"
+//   - N tickets, min < max : "A partir de 5 000 FCFA"
+function computePrixDisplay(tickets) {
+  if (!tickets || tickets.length === 0) return 'Gratuit';
+  var prices = tickets.map(function(t) { return t.price || 0; });
+  var min = Math.min.apply(null, prices);
+  var max = Math.max.apply(null, prices);
+  if (min === 0 && max === 0) return 'Gratuit';
+  if (min === max) return min.toLocaleString('fr-FR') + ' FCFA';
+  return 'A partir de ' + min.toLocaleString('fr-FR') + ' FCFA';
+}
+
+// Sync ticket payload avec DB : update existants, insert new, archive ceux
+// retires. Garde-fou : refuse de reduire places_total sous le nombre deja
+// vendu, et refuse d'archiver un ticket qui a deja des bookings actifs.
+// Retourne la nouvelle liste de tickets (ou null si tickets pas fournis).
+function syncEventTickets(eventId, payload) {
+  if (!Array.isArray(payload)) return Promise.resolve(null);
+  var validationErr = validateTicketsPayload(payload);
+  if (validationErr) {
+    var err = new Error(validationErr);
+    err.userMessage = validationErr;
+    return Promise.reject(err);
+  }
+  return pool.query(
+    'SELECT id, name, price, places_total, places_restantes, sort_order ' +
+    'FROM event_tickets WHERE event_id = $1 AND archived_at IS NULL',
+    [eventId]
+  ).then(function(r) {
+    var existing = {};
+    r.rows.forEach(function(row) { existing[row.id] = row; });
+
+    var inPayloadIds = {};
+    var chain = Promise.resolve();
+
+    payload.forEach(function(t, i) {
+      var name = String(t.name).trim();
+      var price = parseInt(t.price, 10);
+      var placesTotal = parseInt(t.places_total, 10);
+      var sortOrder = i;
+
+      if (t.id && existing[t.id]) {
+        // UPDATE existing : recompute places_restantes = new total - sold.
+        var ex = existing[t.id];
+        var sold = ex.places_total - ex.places_restantes;
+        if (placesTotal < sold) {
+          var e = new Error('oversold');
+          e.userMessage = '« ' + ex.name + ' » : tu ne peux pas réduire à ' + placesTotal + ' places, ' + sold + ' sont déjà vendues.';
+          throw e;
+        }
+        inPayloadIds[t.id] = true;
+        chain = chain.then(function() {
+          return pool.query(
+            'UPDATE event_tickets SET name = $1, price = $2, places_total = $3, ' +
+            'places_restantes = $3 - $4, sort_order = $5, updated_at = NOW() ' +
+            'WHERE id = $6',
+            [name, price, placesTotal, sold, sortOrder, t.id]
+          );
+        });
+      } else {
+        // INSERT new ticket.
+        chain = chain.then(function() {
+          return pool.query(
+            'INSERT INTO event_tickets (event_id, name, price, places_total, places_restantes, sort_order) ' +
+            'VALUES ($1, $2, $3, $4, $4, $5)',
+            [eventId, name, price, placesTotal, sortOrder]
+          );
+        });
+      }
+    });
+
+    // Archive ceux qui ne sont plus dans le payload.
+    Object.keys(existing).forEach(function(idStr) {
+      if (inPayloadIds[idStr]) return;
+      var ex = existing[idStr];
+      var sold = ex.places_total - ex.places_restantes;
+      if (sold > 0) {
+        var e = new Error('cant_archive_sold');
+        e.userMessage = '« ' + ex.name + ' » a déjà ' + sold + ' billets vendus, impossible de le retirer. Garde-le ou archive en V2.';
+        throw e;
+      }
+      chain = chain.then(function() {
+        return pool.query(
+          'UPDATE event_tickets SET archived_at = NOW(), updated_at = NOW() WHERE id = $1',
+          [idStr]
+        );
+      });
+    });
+
+    return chain.then(function() {
+      return fetchEventTickets(eventId);
+    });
+  });
+}
+
+// Valide un payload tickets:[{name, price, places_total, id?}]. Retourne null si OK,
+// ou une string d'erreur. Verifie : non-vide, max 10 tickets (anti-abus),
+// name <= 80 chars, price entier >= 0, places_total entier > 0.
+function validateTicketsPayload(tickets) {
+  if (!Array.isArray(tickets)) return 'tickets doit etre un array';
+  if (tickets.length === 0) return 'Au moins une categorie de place est requise';
+  if (tickets.length > 10) return 'Maximum 10 categories de places par event';
+  for (var i = 0; i < tickets.length; i++) {
+    var t = tickets[i];
+    if (!t || typeof t !== 'object') return 'tickets[' + i + '] invalide';
+    var name = String(t.name || '').trim();
+    if (!name || name.length > 80) return 'tickets[' + i + '].name doit faire 1-80 caracteres';
+    var price = parseInt(t.price, 10);
+    if (isNaN(price) || price < 0) return 'tickets[' + i + '].price doit etre un entier >= 0';
+    var places = parseInt(t.places_total, 10);
+    if (isNaN(places) || places <= 0) return 'tickets[' + i + '].places_total doit etre > 0';
+  }
+  return null;
+}
+
 // GET /events — Liste tous les événements
 // @query {string} category - Filtrer par catégorie (optionnel)
 // @query {string} search - Recherche texte (optionnel)
@@ -257,37 +405,56 @@ router.get('/mine', auth.authMiddleware, function(req, res) {
     [req.userId]
   )
     .then(function(result) {
-      var events = result.rows.map(function(row) {
-        return {
-          id: row.id.toString(),
-          title: row.title,
-          description: row.description,
-          category: row.category,
-          date: row.date,
-          lieu: row.lieu,
-          prix: row.prix_display,
-          prix_num: row.prix,
-          emoji: row.emoji,
-          color: row.color,
-          chaud: row.chaud,
-          image_url: row.image_url,
-          places_total: row.places_total,
-          places_restantes: row.places_restantes,
-          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
-          // Alias lat/lng pour cohérence avec /favorites et le client mobile
-          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
-          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
-          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
-          places_vendues: row.places_vendues,
-          revenue: parseInt(row.revenue) || 0,
-          status: row.status,
-          rejection_reason: row.rejection_reason,
-          created_at: row.created_at,
-          my_role: row.my_role,
-        };
+      var rows = result.rows;
+      if (rows.length === 0) {
+        return res.json({ success: true, events: [] });
+      }
+      // P0#4 : fetch les tickets en batch pour tous les events de l'orga.
+      var ids = rows.map(function(r) { return r.id; });
+      return pool.query(
+        'SELECT id, event_id, name, price, places_total, places_restantes, sort_order ' +
+        'FROM event_tickets WHERE event_id = ANY($1::int[]) AND archived_at IS NULL ' +
+        'ORDER BY sort_order ASC, id ASC',
+        [ids]
+      ).then(function(tkRes) {
+        var ticketsByEvent = {};
+        tkRes.rows.forEach(function(t) {
+          if (!ticketsByEvent[t.event_id]) ticketsByEvent[t.event_id] = [];
+          ticketsByEvent[t.event_id].push(formatTicket(t));
+        });
+        var events = rows.map(function(row) {
+          return {
+            id: row.id.toString(),
+            title: row.title,
+            description: row.description,
+            category: row.category,
+            date: row.date,
+            lieu: row.lieu,
+            prix: row.prix_display,
+            prix_num: row.prix,
+            emoji: row.emoji,
+            color: row.color,
+            chaud: row.chaud,
+            image_url: row.image_url,
+            places_total: row.places_total,
+            places_restantes: row.places_restantes,
+            latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+            longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+            // Alias lat/lng pour cohérence avec /favorites et le client mobile
+            // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+            lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+            lng: row.longitude !== null ? parseFloat(row.longitude) : null,
+            places_vendues: row.places_vendues,
+            revenue: parseInt(row.revenue) || 0,
+            status: row.status,
+            rejection_reason: row.rejection_reason,
+            created_at: row.created_at,
+            my_role: row.my_role,
+            tickets: ticketsByEvent[row.id] || [],
+          };
+        });
+        res.json({ success: true, events: events });
       });
-      res.json({ success: true, events: events });
     })
     .catch(function(err) {
       console.error('Erreur GET /events/mine:', err.message);
@@ -311,7 +478,7 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
     ),
     pool.query(
       'SELECT b.id, b.ref, b.quantity, b.total_amount, b.statut, b.created_at, ' +
-      'b.utilise_at, b.cancelled_at, b.refund_amount, ' +
+      'b.utilise_at, b.cancelled_at, b.refund_amount, b.ticket_id, ' +
       'u.id AS user_id, u.nom, u.prenom, u.phone ' +
       'FROM bookings b LEFT JOIN users u ON u.id = b.user_id ' +
       'WHERE b.event_id = $1 ORDER BY b.created_at DESC',
@@ -321,6 +488,13 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
     // calculer le revenu net reel cote backend (la verite). Per-event override
     // sur events.commission_rate prevaut sur le defaut global.
     pool.query("SELECT key, value FROM app_settings WHERE key IN ('commission_rate', 'cinetpay_fee_rate')"),
+    // P0#4 : tickets non-archives pour breakdown per-category stats.
+    pool.query(
+      'SELECT id, event_id, name, price, places_total, places_restantes, sort_order ' +
+      'FROM event_tickets WHERE event_id = $1 AND archived_at IS NULL ' +
+      'ORDER BY sort_order ASC, id ASC',
+      [eventId]
+    ),
   ])
     .then(function(results) {
       if (results[0].rows.length === 0) {
@@ -384,6 +558,29 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
       stats.cinetpay_fees_total = Math.round(stats.revenue_brut * cinetpayFeeRate);
       stats.revenue_net = stats.revenue_brut - stats.commission_total - stats.cinetpay_fees_total - stats.refund_total;
 
+      // P0#4 Phase 4 : breakdown des stats par ticket. Pour chaque ticket,
+      // on compte billets_vendus / revenue_brut depuis les bookings actifs
+      // (confirme ou utilise) qui matchent ticket_id.
+      var ticketRows = results[3].rows;
+      var ticketStats = {};
+      bookings.forEach(function(b) {
+        if (b.statut !== 'confirme' && b.statut !== 'utilise') return;
+        var tid = b.ticket_id;
+        if (tid == null) return;
+        if (!ticketStats[tid]) ticketStats[tid] = { billets_vendus: 0, revenue_brut: 0, billets_scannes: 0 };
+        ticketStats[tid].billets_vendus += b.quantity;
+        ticketStats[tid].revenue_brut += parseInt(b.total_amount) || 0;
+        if (b.statut === 'utilise') ticketStats[tid].billets_scannes += b.quantity;
+      });
+      var tickets = ticketRows.map(function(t) {
+        var ts = ticketStats[t.id] || { billets_vendus: 0, revenue_brut: 0, billets_scannes: 0 };
+        return Object.assign(formatTicket(t), {
+          billets_vendus: ts.billets_vendus,
+          revenue_brut: ts.revenue_brut,
+          billets_scannes: ts.billets_scannes,
+        });
+      });
+
       res.json({
         success: true,
         event: {
@@ -407,6 +604,7 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
           status: ev.status,
           rejection_reason: ev.rejection_reason,
           created_at: ev.created_at,
+          tickets: tickets,
         },
         stats: stats,
         bookings: bookings.map(function(b) {
@@ -420,6 +618,7 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
             utilise_at: b.utilise_at,
             cancelled_at: b.cancelled_at,
             refund_amount: b.refund_amount != null ? parseInt(b.refund_amount) : null,
+            ticket_id: b.ticket_id != null ? b.ticket_id.toString() : null,
             user: b.user_id ? {
               id: b.user_id.toString(),
               nom: b.nom,
@@ -551,9 +750,37 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
     });
   }
 
-  var prix = parseInt(body.prix) || 0;
-  var prixDisplay = prix > 0 ? prix.toLocaleString('fr-FR') + ' FCFA' : 'Gratuit';
-  var placesTotal = parseInt(body.places_total) || 500;
+  // P0#4 audit : multi-tickets. Si body.tickets est fourni, on l'utilise.
+  // Sinon (legacy clients : ancien mobile, ancien orga form), on synthetise
+  // un seul ticket 'Standard' depuis body.prix + body.places_total.
+  var tickets;
+  if (Array.isArray(body.tickets) && body.tickets.length > 0) {
+    var ticketErr = validateTicketsPayload(body.tickets);
+    if (ticketErr) return res.status(400).json({ success: false, message: ticketErr });
+    tickets = body.tickets.map(function(t, i) {
+      return {
+        name: String(t.name).trim(),
+        price: parseInt(t.price, 10),
+        places_total: parseInt(t.places_total, 10),
+        sort_order: i,
+      };
+    });
+  } else {
+    // Backward compat : 1 ticket 'Standard' synthese.
+    tickets = [{
+      name: 'Standard',
+      price: parseInt(body.prix, 10) || 0,
+      places_total: parseInt(body.places_total, 10) || 500,
+      sort_order: 0,
+    }];
+  }
+  // Aggregates events.* depuis tickets pour rester coherent avec le legacy.
+  var totalPlacesAll = tickets.reduce(function(s, t) { return s + t.places_total; }, 0);
+  var minPrice = Math.min.apply(null, tickets.map(function(t) { return t.price; }));
+
+  var prix = minPrice;
+  var prixDisplay = computePrixDisplay(tickets);
+  var placesTotal = totalPlacesAll;
   var latitude = body.latitude !== undefined && body.latitude !== null && body.latitude !== ''
     ? parseFloat(body.latitude) : null;
   var longitude = body.longitude !== undefined && body.longitude !== null && body.longitude !== ''
@@ -661,24 +888,38 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
   )
     .then(function(result) {
       var row = result.rows[0];
-      res.status(201).json({
-        success: true,
-        message: 'Événement créé. En attente de validation par notre équipe.',
-        event: {
-          id: row.id.toString(),
-          title: row.title,
-          category: row.category,
-          date: row.date,
-          lieu: row.lieu,
-          prix: row.prix_display,
-          latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
-          longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
-          // Alias lat/lng pour cohérence avec /favorites et le client mobile
-          // (MapScreen / EventMiniMap lisent event.lat / event.lng).
-          lat: row.latitude !== null ? parseFloat(row.latitude) : null,
-          lng: row.longitude !== null ? parseFloat(row.longitude) : null,
-          status: row.status
-        }
+      // P0#4 : INSERT les tickets en bulk apres l'event. UNNEST pour 1 query.
+      // Les places_restantes sont initialisees = places_total a la creation.
+      var names = tickets.map(function(t) { return t.name; });
+      var prices = tickets.map(function(t) { return t.price; });
+      var placesArr = tickets.map(function(t) { return t.places_total; });
+      var sortOrders = tickets.map(function(t) { return t.sort_order; });
+      return pool.query(
+        'INSERT INTO event_tickets (event_id, name, price, places_total, places_restantes, sort_order) ' +
+        'SELECT $1, UNNEST($2::varchar[]), UNNEST($3::int[]), UNNEST($4::int[]), UNNEST($4::int[]), UNNEST($5::int[]) ' +
+        'RETURNING id, event_id, name, price, places_total, places_restantes, sort_order, archived_at, created_at, updated_at',
+        [row.id, names, prices, placesArr, sortOrders]
+      ).then(function(tkRes) {
+        res.status(201).json({
+          success: true,
+          message: 'Événement créé. En attente de validation par notre équipe.',
+          event: {
+            id: row.id.toString(),
+            title: row.title,
+            category: row.category,
+            date: row.date,
+            lieu: row.lieu,
+            prix: row.prix_display,
+            latitude: row.latitude !== null ? parseFloat(row.latitude) : null,
+            longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
+            // Alias lat/lng pour cohérence avec /favorites et le client mobile
+            // (MapScreen / EventMiniMap lisent event.lat / event.lng).
+            lat: row.latitude !== null ? parseFloat(row.latitude) : null,
+            lng: row.longitude !== null ? parseFloat(row.longitude) : null,
+            status: row.status,
+            tickets: tkRes.rows.map(formatTicket),
+          }
+        });
       });
     })
     .catch(function(err) {
@@ -867,6 +1108,33 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
       )
         .then(function(updateResult) {
           var row = updateResult.rows[0];
+          // P0#4 : sync les tickets si body.tickets fourni. Pas fourni = ne touche pas.
+          return syncEventTickets(row.id, body.tickets)
+            .then(function(syncedTickets) {
+              // Si tickets ont change, re-aligne events.places_total / prix
+              // pour rester coherent (queries legacy continuent de marcher).
+              if (syncedTickets) {
+                var totalPlacesNew = syncedTickets.reduce(function(s, t) { return s + t.places_total; }, 0);
+                var totalRestantesNew = syncedTickets.reduce(function(s, t) { return s + t.places_restantes; }, 0);
+                var minPriceNew = syncedTickets.length > 0
+                  ? Math.min.apply(null, syncedTickets.map(function(t) { return t.price; }))
+                  : 0;
+                var prixDisplayNew = computePrixDisplay(syncedTickets);
+                return pool.query(
+                  'UPDATE events SET places_total = $1, places_restantes = $2, prix = $3, prix_display = $4, updated_at = NOW() ' +
+                  'WHERE id = $5 RETURNING *',
+                  [totalPlacesNew, totalRestantesNew, minPriceNew, prixDisplayNew, row.id]
+                ).then(function(rr) {
+                  return { row: rr.rows[0], tickets: syncedTickets };
+                });
+              }
+              return fetchEventTickets(row.id).then(function(tks) {
+                return { row: row, tickets: tks };
+              });
+            });
+        })
+        .then(function(out) {
+          var row = out.row;
           res.json({
             success: true,
             message: 'Événement modifié',
@@ -889,12 +1157,18 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
               longitude: row.longitude !== null ? parseFloat(row.longitude) : null,
               // Alias lat/lng pour cohérence avec /favorites + client mobile.
               lat: row.latitude !== null ? parseFloat(row.latitude) : null,
-              lng: row.longitude !== null ? parseFloat(row.longitude) : null
+              lng: row.longitude !== null ? parseFloat(row.longitude) : null,
+              tickets: out.tickets,
             }
           });
         });
     })
     .catch(function(err) {
+      // Erreurs metier (validateur tickets, oversold, cant_archive_sold) ont
+      // un userMessage explicit → retour 400.
+      if (err && err.userMessage) {
+        return res.status(400).json({ success: false, message: err.userMessage });
+      }
       console.error('Erreur PUT /events/:id:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
