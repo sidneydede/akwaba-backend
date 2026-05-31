@@ -372,6 +372,81 @@ router.patch('/me/password', function(req, res) {
     });
 });
 
+// PATCH /admin/me/email — Self-service change de l'email admin (= identifiant
+// de connexion). Re-auth obligatoire via currentPassword. Pas de bump
+// password_changed_at : un changement d'email ne devrait pas tuer les sessions
+// existantes (UX standard GitHub/Stripe). Si tu veux invalider, l'user peut
+// faire /auth/logout apres.
+//
+// Met aussi a jour le fake phone (convention seed-admin : 'admin-' + slug email)
+// pour rester coherent. Conflit unicite (autre admin meme email) capture en 23505.
+// @body {string} newEmail, currentPassword
+router.patch('/me/email', function(req, res) {
+  var newEmail = (req.body.newEmail || '').trim().toLowerCase();
+  var currentPassword = req.body.currentPassword || '';
+
+  if (!newEmail || !currentPassword) {
+    return res.status(400).json({
+      success: false,
+      message: 'Nouvel email et mot de passe actuel requis.'
+    });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+    return res.status(400).json({ success: false, message: 'Email invalide.' });
+  }
+  if (newEmail === (req.admin.email || '').toLowerCase()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Le nouvel email doit etre different de l\'actuel.'
+    });
+  }
+
+  var newFakePhone = 'admin-' + newEmail.replace(/[^a-z0-9]/g, '').slice(0, 14);
+
+  pool.query('SELECT password_hash FROM users WHERE id = $1', [req.admin.id])
+    .then(function(result) {
+      if (result.rows.length === 0 || !result.rows[0].password_hash) {
+        return res.status(404).json({ success: false, message: 'Compte introuvable.' });
+      }
+      return auth.verifyPassword(currentPassword, result.rows[0].password_hash)
+        .then(function(ok) {
+          if (!ok) {
+            logAudit(req.admin.id, 'admin.email_change_fail', 'user', req.admin.id, null);
+            return res.status(401).json({
+              success: false,
+              message: 'Mot de passe actuel incorrect.'
+            });
+          }
+          return pool.query(
+            'UPDATE users SET email = $1, phone = $2, updated_at = NOW() ' +
+            'WHERE id = $3 RETURNING email',
+            [newEmail, newFakePhone, req.admin.id]
+          )
+            .then(function(r) {
+              logAudit(req.admin.id, 'admin.email_change', 'user', req.admin.id, {
+                old_email: req.admin.email,
+                new_email: r.rows[0].email,
+              });
+              res.json({
+                success: true,
+                email: r.rows[0].email,
+                message: 'Email mis a jour. Tes prochaines connexions utiliseront ' + r.rows[0].email + '.',
+              });
+            });
+        });
+    })
+    .catch(function(err) {
+      if (err.code === '23505') {
+        return res.status(409).json({
+          success: false,
+          message: 'Cet email est deja utilise par un autre compte.'
+        });
+      }
+      console.error('Erreur PATCH /admin/me/email:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // POST /admin/auth/logout — Invalide tous les tokens admin existants pour
 // ce compte (bump password_changed_at → SEC M9 rejette les tokens emis avant).
 // Pourquoi pas un blacklist de token specifique : pour un admin, "logout"
