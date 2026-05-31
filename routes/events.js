@@ -304,8 +304,8 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
   Promise.all([
     pool.query(
       'SELECT id, organizer_id, title, description, category, date, start_at, end_at, ' +
-      'lieu, prix, prix_display, emoji, color, chaud, image_url, commission_rate, ' +
-      'places_total, places_restantes, status, rejection_reason, created_at ' +
+      'sales_close_at, lieu, prix, prix_display, emoji, color, chaud, image_url, ' +
+      'commission_rate, places_total, places_restantes, status, rejection_reason, created_at ' +
       'FROM events WHERE id = $1',
       [eventId]
     ),
@@ -394,6 +394,7 @@ router.get('/:id/dashboard', auth.authMiddleware, auth.requireOrganizer, functio
           date: ev.date,
           start_at: ev.start_at,
           end_at: ev.end_at,
+          sales_close_at: ev.sales_close_at,
           lieu: ev.lieu,
           prix: ev.prix_display,
           prix_num: ev.prix,
@@ -592,6 +593,30 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
       endAt = de;
     }
   }
+  // P1#10 audit orga : sales_close_at. Doit etre > now() et < start_at (sinon
+  // pas de sens : on ne ferme pas la billetterie apres la fin de l'event ni
+  // avant maintenant). Tolerance 5 min.
+  var salesCloseAt = null;
+  if (body.sales_close_at) {
+    var dsc = new Date(body.sales_close_at);
+    if (!isNaN(dsc.getTime())) {
+      if (dsc.getTime() < Date.now() - 5 * 60 * 1000) {
+        return res.status(400).json({
+          success: false,
+          code: 'sales_close_in_past',
+          message: 'La date de fermeture des ventes doit être dans le futur.',
+        });
+      }
+      if (startAt && dsc.getTime() > startAt.getTime() + 5 * 60 * 1000) {
+        return res.status(400).json({
+          success: false,
+          code: 'sales_close_after_start',
+          message: 'La fermeture des ventes doit être avant le début de l\'événement.',
+        });
+      }
+      salesCloseAt = dsc;
+    }
+  }
 
   // EVENT-VIDEO : whitelist Cloudinary tenant pour video_url (anti XSS).
   var videoUrl = null;
@@ -610,8 +635,8 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
   }
 
   pool.query(
-    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, video_url, places_total, places_restantes, organizer_id, latitude, longitude, start_at, end_at) ' +
-    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14, $15, $16, $17, $18) RETURNING *',
+    'INSERT INTO events (title, description, category, date, lieu, prix, prix_display, emoji, color, chaud, image_url, video_url, places_total, places_restantes, organizer_id, latitude, longitude, start_at, end_at, sales_close_at) ' +
+    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14, $15, $16, $17, $18, $19) RETURNING *',
     [
       body.title,
       body.description || '',
@@ -630,7 +655,8 @@ router.post('/', auth.authMiddleware, auth.requireOrganizer, function(req, res) 
       latitude,
       longitude,
       startAt,
-      endAt
+      endAt,
+      salesCloseAt
     ]
   )
     .then(function(result) {
@@ -744,6 +770,31 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
           newEndAt = dee;
         }
       }
+      // P1#10 audit orga : sales_close_at edit. Meme validation que POST.
+      // null explicite = clear, undefined = no change (COALESCE).
+      var newSalesCloseAt = undefined;
+      if (body.sales_close_at === null || body.sales_close_at === '') {
+        newSalesCloseAt = null; // clear
+      } else if (body.sales_close_at !== undefined) {
+        var dscu = new Date(body.sales_close_at);
+        if (!isNaN(dscu.getTime())) {
+          if (dscu.getTime() < Date.now() - 5 * 60 * 1000) {
+            return res.status(400).json({
+              success: false,
+              code: 'sales_close_in_past',
+              message: 'La date de fermeture des ventes doit être dans le futur.',
+            });
+          }
+          if (newStartAt && dscu.getTime() > newStartAt.getTime() + 5 * 60 * 1000) {
+            return res.status(400).json({
+              success: false,
+              code: 'sales_close_after_start',
+              message: 'La fermeture des ventes doit être avant le début de l\'événement.',
+            });
+          }
+          newSalesCloseAt = dscu;
+        }
+      }
 
       // EVENT-VIDEO : valide video_url contre tenant Cloudinary.
       // undefined → COALESCE garde l'ancienne valeur.
@@ -786,6 +837,7 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
         'longitude = COALESCE($15, longitude), ' +
         'start_at = COALESCE($16, start_at), ' +
         'end_at = COALESCE($17, end_at), ' +
+        'sales_close_at = CASE WHEN $21::boolean THEN $22 ELSE sales_close_at END, ' +
         'updated_at = NOW() ' +
         'WHERE id = $20 RETURNING *',
         [
@@ -808,7 +860,9 @@ router.put('/:id', auth.authMiddleware, auth.requireOrganizer, function(req, res
           newEndAt,
           newVideoUrl !== undefined,  // $18 — flag : faut-il toucher video_url ?
           newVideoUrl,                // $19 — la nouvelle valeur (null ou string)
-          eventId
+          eventId,
+          newSalesCloseAt !== undefined,  // $21 — flag : faut-il toucher sales_close_at ?
+          newSalesCloseAt                  // $22 — la nouvelle valeur (null ou Date)
         ]
       )
         .then(function(updateResult) {

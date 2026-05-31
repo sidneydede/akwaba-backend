@@ -141,6 +141,11 @@ CREATE INDEX IF NOT EXISTS idx_admin_audit_admin ON admin_audit_log(admin_id, cr
 ALTER TABLE events ADD COLUMN IF NOT EXISTS start_at TIMESTAMP;\n\
 ALTER TABLE events ADD COLUMN IF NOT EXISTS end_at TIMESTAMP;\n\
 \n\
+-- P1#10 audit orga : ferme la billetterie X heures/minutes avant l'event.\n\
+-- Pour un match Elephants a 18h, l'orga peut vouloir stopper la vente a 17h45.\n\
+-- NULL = pas de stop programme, on accepte les bookings jusqu'au start_at.\n\
+ALTER TABLE events ADD COLUMN IF NOT EXISTS sales_close_at TIMESTAMP;\n\
+\n\
 -- Compte de reversement de l'organisateur (mobile money ou bancaire).\n\
 -- Format JSONB : { provider: 'orange_money' | 'mtn_momo' | 'wave' | 'bank',\n\
 --                  number: '+225...', name: 'John Doe',\n\

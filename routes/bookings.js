@@ -78,8 +78,14 @@ router.post('/', auth.authMiddleware, function(req, res) {
     });
   }
 
-  // Récupère l'événement pour vérifier les places et le prix
-  pool.query('SELECT id, title, prix, prix_display, places_restantes FROM events WHERE id = $1', [eventId])
+  // Récupère l'événement pour vérifier les places, le prix, et la fermeture
+  // des ventes (sales_close_at, P1#10 audit orga). start_at sert de fallback :
+  // si pas de sales_close_at programme, on refuse au-dela du debut de l'event.
+  pool.query(
+    'SELECT id, title, prix, prix_display, places_restantes, start_at, sales_close_at ' +
+    'FROM events WHERE id = $1',
+    [eventId]
+  )
     .then(function(eventResult) {
       if (eventResult.rows.length === 0) {
         return res.status(404).json({
@@ -89,6 +95,22 @@ router.post('/', auth.authMiddleware, function(req, res) {
       }
 
       var event = eventResult.rows[0];
+
+      // P1#10 : ferme les ventes selon sales_close_at (ou start_at fallback).
+      // On accorde 1 min de tolerance pour absorber le delai entre check et insert.
+      var now = Date.now();
+      var closeAt = null;
+      if (event.sales_close_at) closeAt = new Date(event.sales_close_at).getTime();
+      else if (event.start_at) closeAt = new Date(event.start_at).getTime();
+      if (closeAt && now > closeAt + 60 * 1000) {
+        return res.status(400).json({
+          success: false,
+          code: 'sales_closed',
+          message: event.sales_close_at
+            ? 'Les ventes pour cet événement sont fermées.'
+            : 'L\'événement a déjà commencé.',
+        });
+      }
 
       if (event.places_restantes < quantity) {
         return res.status(400).json({
@@ -723,5 +745,102 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
 // HMAC + double-check de l'API CinetPay. Aucun endpoint client de confirmation
 // n'est exposé : un tel endpoint laisserait un utilisateur marquer sa propre
 // réservation comme payée sans encaissement réel.
+
+// POST /bookings/:id/refund-orga — Refund partiel/total declenche par l'orga.
+// UX audit orga P1#12 : avant cet endpoint, seul l'admin pouvait initier un
+// refund hors politique. Maintenant l'orga peut rembourser depuis son
+// dashboard event (cas usage : reclamation client, geste commercial,
+// double booking, etc.).
+//
+// @body {number} amount   — montant du refund en FCFA (0 < amount <= total_amount)
+// @body {string} reason   — justification (10 chars min, requise pour audit)
+//
+// Securite : verifie que l'event du booking appartient bien a l'orga connecte.
+// Bookings deja annules sont refuses (idempotence). refund_status = 'pending',
+// l'admin traite le transfert CinetPay via la queue refund existante.
+router.post('/:id/refund-orga', auth.authMiddleware, auth.requireOrganizer, function(req, res) {
+  var bookingId = req.params.id;
+  var body = req.body || {};
+  var amount = parseInt(body.amount, 10);
+  var reason = String(body.reason || '').trim();
+
+  if (isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, message: 'Montant invalide.' });
+  }
+  if (!reason || reason.length < 10) {
+    return res.status(400).json({
+      success: false,
+      message: 'Raison requise (10 caractères min) pour l\'audit.',
+    });
+  }
+
+  // Fetch booking + event (avec organizer_id pour verif ownership).
+  pool.query(
+    'SELECT b.id, b.user_id, b.event_id, b.quantity, b.total_amount, b.statut, ' +
+    'b.refund_status, b.ref, e.title, e.organizer_id ' +
+    'FROM bookings b JOIN events e ON e.id = b.event_id ' +
+    'WHERE b.id = $1',
+    [bookingId]
+  )
+    .then(function(r) {
+      if (r.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Réservation introuvable.' });
+      }
+      var b = r.rows[0];
+      if (b.organizer_id !== req.userId) {
+        return res.status(403).json({
+          success: false,
+          message: 'Cette réservation n\'appartient pas à un de tes events.',
+        });
+      }
+      if (b.statut === 'annule') {
+        return res.status(409).json({
+          success: false,
+          message: 'Cette réservation est déjà annulée.',
+        });
+      }
+      if (amount > b.total_amount) {
+        return res.status(400).json({
+          success: false,
+          message: 'Le montant excède le total payé (' + b.total_amount + ' FCFA).',
+        });
+      }
+
+      var ratio = b.total_amount > 0 ? amount / b.total_amount : 0;
+
+      return pool.query(
+        "UPDATE bookings SET statut = 'annule', cancelled_at = NOW(), " +
+        'refund_amount = $1, refund_ratio = $2, cancellation_reason = $3, ' +
+        "refund_status = 'pending', updated_at = NOW() WHERE id = $4 RETURNING id",
+        [amount, ratio, 'Refund orga : ' + reason, bookingId]
+      )
+        .then(function() {
+          return pool.query(
+            'UPDATE events SET places_restantes = places_restantes + $1 WHERE id = $2',
+            [b.quantity, b.event_id]
+          );
+        })
+        .then(function() {
+          // Notif user
+          push.notifyUser(b.user_id, {
+            title: 'Remboursement initié',
+            body: '« ' + b.title + ' » — ' + amount.toLocaleString('fr-FR') + ' FCFA en cours',
+            data: { type: 'refund_orga_initiated', bookingId: b.id.toString() },
+          });
+        })
+        .then(function() {
+          res.json({
+            success: true,
+            booking_id: b.id.toString(),
+            refund_amount: amount,
+            message: 'Refund de ' + amount.toLocaleString('fr-FR') + ' FCFA enregistré. Traitement CinetPay sous 48h.',
+          });
+        });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /bookings/:id/refund-orga:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
 
 module.exports = router;
