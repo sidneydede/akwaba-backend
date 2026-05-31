@@ -372,6 +372,42 @@ router.patch('/me/password', function(req, res) {
     });
 });
 
+// POST /admin/auth/logout — Invalide tous les tokens admin existants pour
+// ce compte (bump password_changed_at → SEC M9 rejette les tokens emis avant).
+// Pourquoi pas un blacklist de token specifique : pour un admin, "logout"
+// signifie aussi "tue toutes mes sessions ouvertes ailleurs" (autres
+// navigateurs, sessions oubliees). Ratio risque/complexite : SEC M9 reuse OK.
+//
+// Le frontend appelle deja cet endpoint en best-effort lors de POST
+// /api/auth/logout (cookie cleared cote client immediat, backend revoke
+// cote serveur derriere — TODO existant dans akwaba-admin/app/api/auth/
+// logout/route.ts l.16-18).
+router.post('/auth/logout', function(req, res) {
+  // Pourquoi NOW() + 6s : SEC M9 dans middleware/auth.js a une tolerance 5s
+  // (issuedAt < pwChangedAt - 5000) qui protege les tokens "tres frais"
+  // contre les race conditions au moment d'un password change. Pour un
+  // logout, on veut invalider IMMEDIATEMENT le token courant — donc on
+  // pousse pwChangedAt au-dela de la fenetre tolerance pour garantir
+  // l'invalidation du token qui vient de faire l'appel logout.
+  // Side effect : si l'user se reconnecte dans la seconde, son NOUVEAU
+  // token (issuedAt ~ NOW + 0-1s) est aussi revoque par la meme regle.
+  // C'est une fenetre de pain ~1s acceptable (humains ne re-loguent pas
+  // si vite apres logout).
+  pool.query(
+    "UPDATE users SET password_changed_at = NOW() + INTERVAL '6 seconds', " +
+    'updated_at = NOW() WHERE id = $1',
+    [req.admin.id]
+  )
+    .then(function() {
+      logAudit(req.admin.id, 'admin.logout', 'user', req.admin.id, null);
+      res.json({ success: true, message: 'Sessions admin terminees.' });
+    })
+    .catch(function(err) {
+      console.error('Erreur POST /admin/auth/logout:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // 2FA setup ---------------------------------------------------------------
 
 // POST /admin/2fa/setup — Génère un nouveau secret TOTP en attente d'activation.
