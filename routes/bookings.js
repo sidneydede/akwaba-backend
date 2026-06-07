@@ -84,6 +84,12 @@ router.post('/', auth.authMiddleware, function(req, res) {
   // pour les clients legacy (ancien mobile) qui ne envoient que eventId.
   var explicitTicketId = req.body.ticket_id ? parseInt(req.body.ticket_id, 10) : null;
 
+  // DUPLICATE-01 : si l'user a deja un billet (confirme ou en_attente) pour
+  // cet event, on renvoie 409 avec code='duplicate_booking' + details. Le
+  // mobile montre un pop-up "tu as deja un billet, continuer ?" et re-poste
+  // avec confirm_duplicate=true pour bypasser (cas legitime : achat pour un ami).
+  var skipDupCheck = req.body.confirm_duplicate === true;
+
   Promise.all([
     pool.query(
       'SELECT id, title, prix, prix_display, places_restantes, start_at, sales_close_at ' +
@@ -96,14 +102,45 @@ router.post('/', auth.authMiddleware, function(req, res) {
       'ORDER BY sort_order ASC, id ASC',
       [eventId]
     ),
+    skipDupCheck
+      ? Promise.resolve({ rows: [] })
+      : pool.query(
+          'SELECT id, ref, quantity, statut, created_at FROM bookings ' +
+          "WHERE user_id = $1 AND event_id = $2 AND statut IN ('confirme', 'en_attente') " +
+          'ORDER BY created_at DESC LIMIT 5',
+          [req.userId, eventId]
+        ),
   ])
     .then(function(results) {
       var eventResult = results[0];
       var ticketsResult = results[1];
+      var dupResult = results[2];
       if (eventResult.rows.length === 0) {
         return res.status(404).json({
           success: false,
           message: 'Événement non trouvé'
+        });
+      }
+
+      // DUPLICATE-01 (suite) : si doublon trouve, on stoppe ici avec un 409
+      // structure pour le mobile. On NE PAS continuer le flow (pas de place
+      // decrement, pas d'INSERT booking).
+      if (dupResult.rows.length > 0) {
+        var totalExistingQty = dupResult.rows.reduce(function(s, r) { return s + (r.quantity || 1); }, 0);
+        return res.status(409).json({
+          success: false,
+          code: 'duplicate_booking',
+          message: 'Tu as déjà ' + (dupResult.rows.length > 1 ? dupResult.rows.length + ' billets' : 'un billet') +
+            ' pour cet événement (' + totalExistingQty + ' place' + (totalExistingQty > 1 ? 's' : '') + ').',
+          existing_bookings: dupResult.rows.map(function(r) {
+            return {
+              id: r.id.toString(),
+              ref: r.ref,
+              quantity: r.quantity,
+              statut: r.statut,
+              created_at: r.created_at,
+            };
+          }),
         });
       }
 
