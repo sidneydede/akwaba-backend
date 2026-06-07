@@ -746,10 +746,13 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
           [refundAmount, ratio, reason || null, bookingId, initialRefundStatus]
         )
           .then(function() {
-            // Refund Paystack (fire-and-forget). Si l'API call fail, on garde
-            // refund_status='pending' et l'admin pourra retrigger manuellement.
-            // Le webhook refund.processed/failed bumpera ensuite vers 'paid'/'failed'.
-            if (initialRefundStatus === 'pending' && b.transaction_id) {
+            // Refund Paystack (fire-and-forget). Skip si le booking était en
+            // 'en_attente' — aucun paiement réel n'a transité chez Paystack
+            // donc rien à rembourser (Paystack répondrait "transaction_not_found").
+            // Si l'API call fail, on garde refund_status='pending' et l'admin
+            // pourra retrigger manuellement. Le webhook refund.processed/failed
+            // bumpera ensuite vers 'paid'/'failed'.
+            if (initialRefundStatus === 'pending' && b.transaction_id && b.statut === 'confirme') {
               paystack.initiateRefund({
                 transaction: b.transaction_id,
                 amount: refundAmount,
@@ -907,10 +910,12 @@ router.post('/:id/refund-orga', auth.authMiddleware, auth.requireOrganizer, func
         [amount, ratio, 'Refund orga : ' + reason, bookingId]
       )
         .then(function() {
-          // Refund Paystack (fire-and-forget). Si KO, refund_status reste
-          // 'pending' et l'admin retrigger manuellement. Le webhook
-          // refund.processed bumpera vers 'paid' quand Paystack confirme.
-          if (b.transaction_id) {
+          // Refund Paystack (fire-and-forget). Skip si le booking n'a jamais
+          // été payé (statut='en_attente') — Paystack répondrait
+          // "transaction_not_found" puisqu'aucune charge réelle n'existe.
+          // Si KO, refund_status reste 'pending' et l'admin retrigger manuellement.
+          // Le webhook refund.processed bumpera vers 'paid' quand Paystack confirme.
+          if (b.transaction_id && b.statut === 'confirme') {
             paystack.initiateRefund({
               transaction: b.transaction_id,
               amount: amount,
