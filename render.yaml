@@ -1,8 +1,8 @@
-databases:
-  - name: akwaba-db
-    plan: basic-256mb
-    databaseName: akwaba_db
-    user: akwaba_user
+# DB Postgres : migrée de Render Postgres → Neon (2026-06-07). DATABASE_URL est
+# désormais set manuellement dans le dashboard Render (Environment), pas via
+# fromDatabase. L'ancien bloc `databases:` + le fromDatabase de DATABASE_URL
+# ont été retirés pour éviter que le blueprint sync re-tente de provisionner
+# un Postgres Render fantôme à chaque deploy.
 
 services:
   - type: web
@@ -13,10 +13,10 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
+      # DATABASE_URL : valeur Neon, set manuellement dans Render dashboard
+      # (sync: false = jamais en repo). Cf. .env local pour le format.
       - key: DATABASE_URL
-        fromDatabase:
-          name: akwaba-db
-          property: connectionString
+        sync: false
       - key: TOKEN_SECRET
         generateValue: true
       - key: NODE_ENV
@@ -58,5 +58,5 @@ services:
         sync: false
       - key: RESEND_FROM
         sync: false
-      - key: FRONT_RETURN_URL # URL de retour après paiement CinetPay
+      - key: FRONT_RETURN_URL # URL de retour après paiement (callback Paystack)
         sync: false
