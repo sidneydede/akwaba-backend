@@ -9,6 +9,7 @@ var pool = require('../db/pool');
 var auth = require('../middleware/auth');
 var push = require('../services/push');
 var cinetpay = require('../services/cinetpay');
+var paystack = require('../services/paystack');
 var followsRouter = require('./follows');
 var passwordPolicy = require('../services/passwordPolicy');
 
@@ -1610,19 +1611,21 @@ router.post('/payouts/:id/release', auth.requireAdminRole(['finance']), function
       var accountSnapshot = p.payout_account;
       var netAmount = parseInt(p.net_amount);
 
-      // Si CinetPay Transfer activé + compte renseigné, déclenche le transfer.
+      // Paystack Transfer si compte renseigné + service configuré. Sinon
+      // mode manuel (status 'manual_required') — l'admin finance fait le
+      // virement via dashboard Paystack et cette route ne fait que tracer.
       var transferPromise;
-      if (cinetpay.isTransferEnabled() && accountSnapshot && accountSnapshot.provider) {
-        transferPromise = cinetpay.transferPayout({
+      if (paystack.isConfigured() && accountSnapshot && accountSnapshot.provider) {
+        transferPromise = paystack.transferPayout({
           amount: netAmount,
           account: Object.assign({}, accountSnapshot, { email: p.organizer_email }),
-          reference: 'AKWABA-PAYOUT-' + p.id,
+          reference: 'PAYOUT-' + p.id,
         });
       } else {
         transferPromise = Promise.resolve({
           ok: false,
           status: 'manual_required',
-          raw: { message: 'Transfer manuel — CinetPay Transfer non activé ou compte absent' },
+          raw: { message: 'Transfer manuel — Paystack non configuré ou compte absent' },
         });
       }
 

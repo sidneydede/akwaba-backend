@@ -1,21 +1,21 @@
-// jobs/reconcile-payments.js — Réconciliation périodique des paiements CinetPay
+// jobs/reconcile-payments.js — Réconciliation périodique des paiements Paystack
 //
 // Pourquoi : un utilisateur peut être débité (Orange Money prélève) sans que le webhook
-// /payments/notify n'arrive. Cas très fréquent en CI (3-5 min de latence Orange, webhook
-// qui échoue, app fermée avant retour). Sans ce job, un booking 'en_attente' reste bloqué,
-// l'utilisateur a payé pour rien et la place est immobilisée.
+// /payments/paystack-notify n'arrive. Latence MoMo CI fréquente (3-5 min), webhook qui
+// échoue côté Paystack, app fermée avant retour. Sans ce job, un booking 'en_attente'
+// reste bloqué, l'utilisateur a payé pour rien et la place est immobilisée.
 //
 // Stratégie :
 //   - Toutes les 60 secondes, on prend les bookings 'en_attente' avec un transaction_id,
 //     créés il y a > 2 min mais < 30 min (au-delà on considère expiré).
-//   - On interroge CinetPay /v2/payment/check pour chaque transaction_id.
-//   - ACCEPTED → on confirme le booking (idem webhook).
-//   - REFUSED  → on annule le booking et on relâche les places.
-//   - PENDING  → on laisse passer un cycle (CinetPay a peut-être pas encore reçu Orange).
+//   - On interroge GET /transaction/verify/:reference Paystack pour chaque ref.
+//   - status='success'  → on confirme le booking (idem webhook).
+//   - status='failed'|'abandoned' → on annule le booking et on relâche les places.
+//   - status='ongoing'|'pending'  → on laisse passer un cycle.
 //   - Au-delà de 30 min : on annule par timeout.
 
 var pool = require('../db/pool');
-var cinetpay = require('./../services/cinetpay');
+var paystack = require('./../services/paystack');
 var push = require('../services/push');
 
 // Notifications copiées de bookings.js — DRY non strict pour éviter import circulaire.
@@ -41,17 +41,17 @@ function notifyFailed(b) {
   });
 }
 
-// Traite un booking : interroge CinetPay et applique le verdict.
+// Traite un booking : interroge Paystack et applique le verdict.
 // @param {object} b - Booking row joint avec event
 // @returns {Promise<string>} - Verdict appliqué ('confirme' | 'annule' | 'pending' | 'skip')
 function reconcileOne(b) {
-  return cinetpay.verifyTransactionWithApi(b.transaction_id)
+  return paystack.verifyTransaction(b.transaction_id)
     .then(function(check) {
       var status = check.status;
 
-      // CinetPay confirme : on transite vers 'confirme' (idempotent — autre process
+      // Paystack confirme : on transite vers 'confirme' (idempotent — autre process
       // pourrait avoir déjà confirmé via le webhook entre-temps, on accepte).
-      if (status === 'ACCEPTED') {
+      if (status === 'success') {
         return pool.query(
           "UPDATE bookings SET statut = 'confirme', updated_at = NOW() " +
           "WHERE id = $1 AND statut = 'en_attente' RETURNING id",
@@ -64,15 +64,15 @@ function reconcileOne(b) {
             pool.query(
               'INSERT INTO payments (transaction_id, amount, method, status, booking_id) VALUES ($1, $2, $3, $4, $5) ' +
               'ON CONFLICT (transaction_id) DO UPDATE SET status = $4, booking_id = $5, updated_at = NOW()',
-              [b.transaction_id, b.total_amount, b.paiement_method, 'ACCEPTED', b.id]
+              [b.transaction_id, b.total_amount, b.paiement_method, 'success', b.id]
             ).catch(function(e) { console.error('[reconcile] erreur payments insert:', e.message); });
           }
           return 'confirme';
         });
       }
 
-      // CinetPay refuse : on annule et on relâche les places.
-      if (status === 'REFUSED' || status === 'CANCELLED' || status === 'EXPIRED') {
+      // Paystack refuse : on annule et on relâche les places.
+      if (status === 'failed' || status === 'abandoned' || status === 'reversed') {
         return pool.query(
           "UPDATE bookings SET statut = 'annule', updated_at = NOW() " +
           "WHERE id = $1 AND statut = 'en_attente' RETURNING id",
@@ -90,18 +90,18 @@ function reconcileOne(b) {
         });
       }
 
-      // PENDING / WAITING / NOT_FOUND : on laisse encore mariner
+      // ongoing / pending / processing : on laisse encore mariner
       return 'pending';
     })
     .catch(function(err) {
-      // Erreur réseau CinetPay : on retentera au cycle suivant. Ne pas re-throw pour
+      // Erreur réseau Paystack : on retentera au cycle suivant. Ne pas re-throw pour
       // ne pas casser la batch — un booking mort ne doit pas bloquer les autres.
       console.error('[reconcile] erreur ' + b.ref + ':', err.message);
       return 'error';
     });
 }
 
-// Boucle de réconciliation. Pas de Promise.all pour éviter de saturer CinetPay
+// Boucle de réconciliation. Pas de Promise.all pour éviter de saturer Paystack
 // (séquentiel, max 50 bookings par tick — au-delà c'est qu'il y a un problème plus large).
 function reconcilePending() {
   return pool.query(

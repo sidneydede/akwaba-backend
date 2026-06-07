@@ -1,11 +1,16 @@
-// routes/payments.js — Webhook CinetPay et vérification paiement
-// POST /payments/notify : webhook appelé par CinetPay après paiement
+// routes/payments.js — Webhooks paiement (Paystack actif, CinetPay legacy)
+//
+// Routes :
+//   POST /payments/paystack-notify — webhook Paystack (charge/transfer/refund)
+//   POST /payments/notify          — webhook CinetPay (legacy, sera supprime)
+//   POST /payments/verify          — lookup statut transaction depuis la DB
 
 var express = require('express');
 var router = express.Router();
 var pool = require('../db/pool');
 var push = require('../services/push');
 var cinetpay = require('../services/cinetpay');
+var paystack = require('../services/paystack');
 
 // Notifie participant + organisateur quand un booking est confirmé via webhook
 // (factorisé pour éviter la duplication avec routes/bookings.js).
@@ -199,6 +204,157 @@ router.post('/verify', function(req, res) {
       console.error('Erreur verify paiement:', err.message);
       res.status(500).json({ success: false, message: 'Erreur serveur' });
     });
+});
+
+// ============================================================
+// Paystack webhook — dispatcher d'events
+// ============================================================
+//
+// Paystack envoie des events typés (charge.success, transfer.success, etc.)
+// avec une signature HMAC-SHA512 du raw body dans le header x-paystack-signature.
+// Le verify callback de express.json() dans server.js capture req.rawBody.
+//
+// Events gérés :
+//   - charge.success      → confirme le booking (statut='confirme')
+//   - transfer.success    → marque le payout comme transferred
+//   - transfer.failed     → marque le payout comme failed (admin re-trigger)
+//   - transfer.reversed   → idem failed (fonds retournés)
+//   - refund.processed    → marque le refund booking comme paid
+//   - refund.failed       → marque le refund booking comme failed
+//
+// On répond TOUJOURS 200 quand on a accusé réception (même si on ignore
+// l'event ou que la transac n'est pas la nôtre) pour éviter que Paystack
+// retente indéfiniment.
+router.post('/paystack-notify', function(req, res) {
+  var signature = req.headers['x-paystack-signature'];
+  var rawBody = req.rawBody;
+  var body = req.body || {};
+  var eventType = body.event || 'unknown';
+
+  console.log('Webhook Paystack reçu:', eventType, body.data && body.data.reference);
+
+  // Couche unique : Paystack n'a pas d'API "check-by-id" comme CinetPay
+  // (verifyTransaction n'est utilisé que pour charges). La signature HMAC
+  // est donc la seule défense — c'est ce que Paystack documente. Fail-closed.
+  if (!paystack.verifyWebhookSignature(rawBody, signature)) {
+    console.error('Webhook Paystack : signature HMAC invalide pour', eventType);
+    return res.status(401).json({ success: false, message: 'Signature invalide' });
+  }
+
+  var data = body.data || {};
+  var reference = data.reference || (data.transaction && data.transaction.reference);
+
+  // ─── charge.success ──────────────────────────────────────────────────
+  // Equivalent du webhook CinetPay : confirme le booking. On double-check
+  // via verifyTransaction pour matcher le pattern fail-safe historique
+  // (un attaquant qui aurait la clé secrète et forgerait un webhook serait
+  // démasqué ici parce que la transac n'existe pas vraiment chez Paystack).
+  if (eventType === 'charge.success') {
+    if (!reference) {
+      return res.status(400).json({ success: false, message: 'Reference manquante' });
+    }
+    return paystack.verifyTransaction(reference)
+      .then(function(check) {
+        var realStatus = check.status;
+        var realAmount = check.amount || 0;
+        return pool.query(
+          'INSERT INTO payments (transaction_id, amount, method, status, cinetpay_data) ' +
+          'VALUES ($1, $2, $3, $4, $5) ' +
+          'ON CONFLICT (transaction_id) DO UPDATE SET status = $4, cinetpay_data = $5, updated_at = NOW() RETURNING *',
+          [reference, realAmount, 'paystack', realStatus, JSON.stringify({ webhook: body, check: check.raw })]
+        )
+          .then(function() {
+            if (!check.ok) {
+              console.log('Webhook Paystack : transac non success selon API:', reference, realStatus);
+              return res.json({ success: true, message: 'Webhook enregistré, statut: ' + realStatus });
+            }
+            return pool.query(
+              "UPDATE bookings SET statut = 'confirme', updated_at = NOW() " +
+              "WHERE transaction_id = $1 AND statut != 'confirme' RETURNING id",
+              [reference]
+            )
+              .then(function(updateResult) {
+                updateResult.rows.forEach(function(row) {
+                  notifyBookingConfirmed(row.id);
+                  awardReferralBonusIfEligible(row.id);
+                });
+                res.json({
+                  success: true,
+                  message: 'Paiement vérifié et réservation confirmée',
+                  bookings_confirmed: updateResult.rows.length,
+                });
+              });
+          });
+      })
+      .catch(function(err) {
+        console.error('Erreur webhook charge.success:', err.message);
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+      });
+  }
+
+  // ─── transfer.success / transfer.failed / transfer.reversed ──────────
+  // reference = celle qu'on a envoyée à /transfer (format 'PAYOUT-N').
+  // On l'utilise pour matcher la ligne payouts.
+  if (eventType === 'transfer.success' || eventType === 'transfer.failed' || eventType === 'transfer.reversed') {
+    var transferRef = data.reference || data.transfer_code;
+    if (!transferRef) {
+      return res.json({ success: true, message: 'Reference transfer manquante, ignoré' });
+    }
+    // Extrait l'id payout depuis 'PAYOUT-N'. Si pattern différent, on lookup
+    // par transfer_reference (fallback).
+    var payoutId = null;
+    var m = String(transferRef).match(/^PAYOUT-(\d+)$/);
+    if (m) payoutId = parseInt(m[1], 10);
+
+    var newTransferStatus = eventType === 'transfer.success' ? 'success' : (eventType === 'transfer.failed' ? 'failed' : 'reversed');
+
+    var updateQuery, updateParams;
+    if (payoutId) {
+      updateQuery = 'UPDATE payouts SET transfer_status = $1, transfer_data = $2, updated_at = NOW() WHERE id = $3 RETURNING id';
+      updateParams = [newTransferStatus, JSON.stringify(body), payoutId];
+    } else {
+      updateQuery = 'UPDATE payouts SET transfer_status = $1, transfer_data = $2, updated_at = NOW() WHERE transfer_reference = $3 RETURNING id';
+      updateParams = [newTransferStatus, JSON.stringify(body), transferRef];
+    }
+    return pool.query(updateQuery, updateParams)
+      .then(function(r) {
+        console.log('Webhook Paystack ' + eventType + ' : payout', r.rows.length, 'maj');
+        res.json({ success: true, message: eventType + ' enregistré', payouts_updated: r.rows.length });
+      })
+      .catch(function(err) {
+        console.error('Erreur webhook ' + eventType + ':', err.message);
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+      });
+  }
+
+  // ─── refund.processed / refund.failed ────────────────────────────────
+  // data.transaction.reference = la ref initiale du paiement (notre booking ref).
+  if (eventType === 'refund.processed' || eventType === 'refund.failed') {
+    var refundedTx = (data.transaction && data.transaction.reference) || data.reference;
+    if (!refundedTx) {
+      return res.json({ success: true, message: 'Reference transac refund manquante, ignoré' });
+    }
+    var newRefundStatus = eventType === 'refund.processed' ? 'paid' : 'failed';
+    return pool.query(
+      'UPDATE bookings SET refund_status = $1, refund_paid_at = ' +
+      "CASE WHEN $1 = 'paid' THEN NOW() ELSE refund_paid_at END, updated_at = NOW() " +
+      'WHERE transaction_id = $2 RETURNING id',
+      [newRefundStatus, refundedTx]
+    )
+      .then(function(r) {
+        console.log('Webhook Paystack ' + eventType + ' : booking', r.rows.length, 'maj');
+        res.json({ success: true, message: eventType + ' enregistré', bookings_updated: r.rows.length });
+      })
+      .catch(function(err) {
+        console.error('Erreur webhook ' + eventType + ':', err.message);
+        res.status(500).json({ success: false, message: 'Erreur serveur' });
+      });
+  }
+
+  // Events non gérés (charge.failed, customeridentification.*, etc.) :
+  // on accuse réception pour ne pas faire retenter Paystack.
+  console.log('Webhook Paystack ignoré:', eventType);
+  res.json({ success: true, message: 'Event ignoré: ' + eventType });
 });
 
 module.exports = router;

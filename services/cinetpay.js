@@ -1,22 +1,22 @@
-// services/cinetpay.js — Helpers de vérification CinetPay
-// Deux couches de défense contre la falsification de webhook :
-//   1. Vérification HMAC du header x-token (rapide, rejette les appels triviaux)
-//   2. Double-check via l'API CinetPay /v2/payment/check (authoritative, infalsifiable)
+// services/cinetpay.js — Helpers CinetPay (LEGACY, en cours de suppression).
+//
+// Migration Paystack 2026-06-07 : ce service est désormais dead code, sauf
+// la route /payments/notify (legacy webhook CinetPay) qui pourrait être
+// retentée par CinetPay si une transaction sandbox antérieure rejoue.
+// On garde le service pour ne pas casser cette compat tant qu'on n'a pas
+// retiré /payments/notify. Tous les nouveaux paiements passent par Paystack
+// (cf. services/paystack.js + /payments/paystack-notify).
+//
+// La fail-fast historique sur CINETPAY_SECRET_KEY en prod a été retirée :
+// si la var n'est plus configurée (post-migration), verifyHmacToken
+// fail-CLOSED automatiquement (refuse tous les webhooks) — comportement
+// désiré puisqu'aucun webhook légitime CinetPay ne devrait plus arriver.
 
 var crypto = require('crypto');
 
 var CINETPAY_API_KEY = process.env.CINETPAY_API_KEY;
 var CINETPAY_SITE_ID = process.env.CINETPAY_SITE_ID;
 var CINETPAY_SECRET_KEY = process.env.CINETPAY_SECRET_KEY;
-
-// Sprint 0 security : fail-fast si SECRET_KEY absente en prod. Sinon le
-// verifyHmacToken renvoyait true (fail-OPEN) — un attaquant pouvait forger
-// des webhooks tant que le double-check API était down.
-if (process.env.NODE_ENV === 'production' && !CINETPAY_SECRET_KEY) {
-  throw new Error(
-    'CINETPAY_SECRET_KEY manquante en production. Configure la var sur Render avant de démarrer.'
-  );
-}
 var CINETPAY_INIT_URL = 'https://api-checkout.cinetpay.com/v2/payment';
 var CINETPAY_CHECK_URL = 'https://api-checkout.cinetpay.com/v2/payment/check';
 // URL de base de l'API backend (utilisée pour notify_url envoyée à CinetPay)

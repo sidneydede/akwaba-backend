@@ -59,7 +59,15 @@ app.use(helmet({
 // Body JSON limité à 100 KB. Routes d'upload utilisent Cloudinary direct
 // upload (pas de transit par le backend) donc 100KB suffit largement pour
 // tout payload "normal" (formulaires, JSON métier).
-app.use(express.json({ limit: '100kb' }));
+//
+// `verify` capture le raw body sous req.rawBody pour les webhooks qui
+// signent le payload brut (Paystack : HMAC-SHA512 du raw body vs header
+// x-paystack-signature). Sans ça, le re-stringify du JSON parsé pourrait
+// différer (ordre de clés, espaces) → signature invalide.
+app.use(express.json({
+  limit: '100kb',
+  verify: function(req, res, buf) { req.rawBody = buf.toString('utf8'); },
+}));
 
 // CORS strict en production. L'app mobile native envoie sans Origin (Expo Go
 // natif) → toujours autorisé. Les domaines web sont whitelistés. En dev
@@ -192,11 +200,11 @@ app.use(function(err, req, res, next) {
 app.listen(PORT, function() {
   console.log('Akwaba API démarrée sur le port ' + PORT);
 
-  // Worker de réconciliation paiement CinetPay (PAY-03).
+  // Worker de réconciliation paiement Paystack (PAY-03).
   // Tourne en mémoire avec setInterval. Render free tier endort le serveur après 15min,
   // ce qui mettra le worker en pause aussi — le prochain hit HTTP le réveille.
-  // Désactivable via DISABLE_RECONCILE=true (utile en dev local sans creds CinetPay).
-  if (process.env.DISABLE_RECONCILE !== 'true' && process.env.CINETPAY_API_KEY) {
+  // Désactivable via DISABLE_RECONCILE=true (utile en dev local sans creds Paystack).
+  if (process.env.DISABLE_RECONCILE !== 'true' && process.env.PAYSTACK_SECRET_KEY) {
     var reconcile = require('./jobs/reconcile-payments');
     reconcile.start();
   }

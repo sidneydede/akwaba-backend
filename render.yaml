@@ -29,7 +29,13 @@ services:
         sync: false
       - key: AT_SENDER_ID
         sync: false
-      # Paiements CinetPay — REQUIS pour la billetterie
+      # Paiements Paystack — REQUIS pour la billetterie (migration 2026-06-07)
+      - key: PAYSTACK_SECRET_KEY
+        sync: false
+      - key: PAYSTACK_PUBLIC_KEY
+        sync: false
+      # CinetPay legacy — dead code en cours de suppression. Vars conservées
+      # pour ne pas casser le boot tant que services/cinetpay.js est référencé.
       - key: CINETPAY_API_KEY
         sync: false
       - key: CINETPAY_SITE_ID

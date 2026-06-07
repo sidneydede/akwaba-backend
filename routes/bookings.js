@@ -9,6 +9,7 @@ var auth = require('../middleware/auth');
 var push = require('../services/push');
 var qr = require('../services/qr');
 var cinetpay = require('../services/cinetpay');
+var paystack = require('../services/paystack');
 var userAudit = require('../services/userAudit');
 var waitlistRouter = require('./waitlist');
 
@@ -181,8 +182,9 @@ router.post('/', auth.authMiddleware, function(req, res) {
               );
             })
             .then(function() {
-              // Récupère les infos user pour CinetPay
-              return pool.query('SELECT id, nom, prenom, phone FROM users WHERE id = $1', [req.userId]);
+              // Récupère les infos user pour le checkout Paystack (email
+              // obligatoire côté Paystack, fallback placeholder si absent).
+              return pool.query('SELECT id, nom, prenom, phone, email FROM users WHERE id = $1', [req.userId]);
             })
             .then(function(userResult) {
               var user = userResult.rows[0] || {};
@@ -223,23 +225,31 @@ router.post('/', auth.authMiddleware, function(req, res) {
                 });
               }
 
-              // Initie le paiement CinetPay et récupère l'URL à ouvrir côté mobile.
-              return cinetpay.initPayment({
-                ref: ref,
+              // Initie le paiement Paystack (hosted checkout) et récupère
+              // l'URL à ouvrir côté mobile. payment_url = authorization_url
+              // Paystack — le frontend EventScreen consomme cette clé.
+              return paystack.initPayment({
+                reference: ref,
                 amount: totalAmount,
                 description: '« ' + event.title + ' » · ' + quantity + ' billet' + (quantity > 1 ? 's' : ''),
                 customer: {
                   id: user.id,
-                  name: user.nom,
-                  surname: user.prenom,
+                  name: ((user.prenom || '') + ' ' + (user.nom || '')).trim() || 'Client',
                   phone: user.phone,
+                  email: user.email,
                 },
-                channels: paiement === 'card' ? 'CREDIT_CARD' : 'ALL',
+                // Le picker côté frontend (Orange/MTN/Wave/Djamo) reste pour
+                // UX mais sa valeur n'oriente le routage que si l'user a
+                // choisi carte bancaire. Sinon Paystack affiche tous les
+                // canaux et l'user re-picke sur la page hosted.
+                channels: paiement === 'carte_bancaire' || paiement === 'card'
+                  ? ['card']
+                  : ['mobile_money', 'card'],
               })
                 .then(function(initResult) {
                   if (!initResult.ok) {
-                    // Init CinetPay a échoué : on annule le booking et on relâche les places.
-                    console.error('CinetPay init échoué pour', ref, ':', initResult.raw);
+                    // Init Paystack a échoué : on annule le booking et on relâche les places.
+                    console.error('Paystack init échoué pour', ref, ':', initResult.raw);
                     return pool.query(
                       "UPDATE bookings SET statut = 'annule', updated_at = NOW() WHERE id = $1",
                       [booking.id]
@@ -674,6 +684,7 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
 
   pool.query(
     'SELECT b.id, b.user_id, b.event_id, b.ticket_id, b.quantity, b.total_amount, b.statut, ' +
+    'b.transaction_id, ' +
     'e.title, e.start_at, e.organizer_id ' +
     'FROM bookings b JOIN events e ON e.id = b.event_id ' +
     'WHERE b.id = $1',
@@ -734,6 +745,26 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
           'refund_status = $5, updated_at = NOW() WHERE id = $4 RETURNING id',
           [refundAmount, ratio, reason || null, bookingId, initialRefundStatus]
         )
+          .then(function() {
+            // Refund Paystack (fire-and-forget). Si l'API call fail, on garde
+            // refund_status='pending' et l'admin pourra retrigger manuellement.
+            // Le webhook refund.processed/failed bumpera ensuite vers 'paid'/'failed'.
+            if (initialRefundStatus === 'pending' && b.transaction_id) {
+              paystack.initiateRefund({
+                transaction: b.transaction_id,
+                amount: refundAmount,
+                reason: 'Annulation user' + (reason ? ' : ' + reason : ''),
+              })
+                .then(function(rf) {
+                  if (rf.ok) {
+                    console.log('Refund Paystack initié:', b.transaction_id, 'status:', rf.status);
+                  } else {
+                    console.error('Refund Paystack échoué:', b.transaction_id, rf.raw);
+                  }
+                })
+                .catch(function(e) { console.error('Refund Paystack exception:', e.message); });
+            }
+          })
           .then(function() {
             // P0#4 : libere la place sur LE TICKET specifique (si ticket_id present)
             if (b.ticket_id) {
@@ -838,7 +869,7 @@ router.post('/:id/refund-orga', auth.authMiddleware, auth.requireOrganizer, func
   // Fetch booking + event (avec organizer_id pour verif ownership).
   pool.query(
     'SELECT b.id, b.user_id, b.event_id, b.ticket_id, b.quantity, b.total_amount, b.statut, ' +
-    'b.refund_status, b.ref, e.title, e.organizer_id ' +
+    'b.refund_status, b.ref, b.transaction_id, e.title, e.organizer_id ' +
     'FROM bookings b JOIN events e ON e.id = b.event_id ' +
     'WHERE b.id = $1',
     [bookingId]
@@ -875,6 +906,26 @@ router.post('/:id/refund-orga', auth.authMiddleware, auth.requireOrganizer, func
         "refund_status = 'pending', updated_at = NOW() WHERE id = $4 RETURNING id",
         [amount, ratio, 'Refund orga : ' + reason, bookingId]
       )
+        .then(function() {
+          // Refund Paystack (fire-and-forget). Si KO, refund_status reste
+          // 'pending' et l'admin retrigger manuellement. Le webhook
+          // refund.processed bumpera vers 'paid' quand Paystack confirme.
+          if (b.transaction_id) {
+            paystack.initiateRefund({
+              transaction: b.transaction_id,
+              amount: amount,
+              reason: 'Refund orga : ' + reason,
+            })
+              .then(function(rf) {
+                if (rf.ok) {
+                  console.log('Refund Paystack initié (orga):', b.transaction_id, 'status:', rf.status);
+                } else {
+                  console.error('Refund Paystack échoué (orga):', b.transaction_id, rf.raw);
+                }
+              })
+              .catch(function(e) { console.error('Refund Paystack exception (orga):', e.message); });
+          }
+        })
         .then(function() {
           // P0#4 : libere la place sur le ticket specifique en + de events.
           if (b.ticket_id) {
