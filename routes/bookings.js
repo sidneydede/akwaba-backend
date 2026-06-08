@@ -389,6 +389,28 @@ router.get('/', auth.authMiddleware, function(req, res) {
     });
 });
 
+// GET /bookings/by-ref/:ref — Check leger du statut d'un booking.
+// Utilise par le mobile apres fermeture du browser Paystack : on poll
+// quelques secondes pour distinguer "user a paye" (statut='confirme')
+// de "user a abandonne" (statut reste 'en_attente').
+// @param {string} ref - reference du booking (ex 'AKW-A1B2C3D4')
+router.get('/by-ref/:ref', auth.authMiddleware, function(req, res) {
+  pool.query(
+    'SELECT statut FROM bookings WHERE ref = $1 AND user_id = $2',
+    [req.params.ref, req.userId]
+  )
+    .then(function(result) {
+      if (result.rows.length === 0) {
+        return res.status(404).json({ success: false, message: 'Booking introuvable' });
+      }
+      res.json({ success: true, statut: result.rows[0].statut });
+    })
+    .catch(function(err) {
+      console.error('Erreur GET /bookings/by-ref:', err.message);
+      res.status(500).json({ success: false, message: 'Erreur serveur' });
+    });
+});
+
 // Helper : verifie que req.userId est autorise a scanner les billets de
 // l'event (organizer_id OU event_staff entry). Retourne une promesse qui
 // resolve true/false. Utilise par /check-in et /check-in-batch pour
