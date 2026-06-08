@@ -15,6 +15,13 @@ var crypto = require('crypto');
 
 var PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 var PAYSTACK_BASE = 'https://api.paystack.co';
+
+// Paystack attend TOUS les montants en subunit (×100), y compris XOF qui
+// n'a pourtant pas de subunit officiel. Si on envoie 200 FCFA brut, Paystack
+// debite 2 FCFA (interprete comme 200/100). La conversion est encapsulee
+// ici — toutes les routes appelantes manipulent du FCFA "naturel".
+function toSubunit(amount) { return parseInt(amount, 10) * 100; }
+function fromSubunit(amount) { return Math.round(parseInt(amount, 10) / 100); }
 var BACKEND_URL = process.env.BACKEND_URL || 'https://akwaba-backend.onrender.com';
 // Page de retour apres paiement. Le webhook fait foi cote backend ; cette URL
 // est juste l'experience visuelle du user en sortie de Paystack hosted page.
@@ -90,7 +97,7 @@ function initPayment(params) {
 
   var body = {
     email: email,
-    amount: parseInt(params.amount, 10), // XOF entier
+    amount: toSubunit(params.amount),
     currency: 'XOF',
     reference: params.reference,
     callback_url: FRONT_RETURN_URL,
@@ -150,7 +157,7 @@ function verifyTransaction(reference) {
     .then(function(json) {
       var data = json.data || {};
       var status = data.status || 'unknown';
-      var amount = data.amount != null ? parseInt(data.amount, 10) : 0;
+      var amount = data.amount != null ? fromSubunit(data.amount) : 0;
       var ok = json.status === true && status === 'success';
       return { ok: ok, status: status, amount: amount, raw: json };
     });
@@ -278,7 +285,7 @@ function transferPayout(params) {
       }
       var body = {
         source: 'balance',
-        amount: parseInt(params.amount, 10),
+        amount: toSubunit(params.amount),
         recipient: recipientResult.recipient_code,
         reason: 'EventNextDoor payout ' + params.reference,
         reference: params.reference,
@@ -330,7 +337,7 @@ function initiateRefund(params) {
   var body = {
     transaction: params.transaction,
   };
-  if (params.amount != null) body.amount = parseInt(params.amount, 10);
+  if (params.amount != null) body.amount = toSubunit(params.amount);
   if (params.reason) body.merchant_note = params.reason;
 
   return fetch(PAYSTACK_BASE + '/refund', {
