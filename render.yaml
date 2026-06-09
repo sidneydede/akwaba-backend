@@ -22,7 +22,18 @@ services:
       - key: NODE_ENV
         value: production
       # Secrets renseignés dans le dashboard Render (sync: false = jamais en repo).
-      # OTP SMS (Africa's Talking) — REQUIS pour login/register
+      # OTP SMS — REQUIS pour login/register. Multi-provider (cf. services/sms.js).
+      # Sélection du provider actif (vide = auto-détection : premier configuré).
+      #   - 'termii'         → utilise TERMII_* (paiement MoMo CI direct, recommandé)
+      #   - 'africastalking' → utilise AT_*    (legacy, paiement carte/PayPal)
+      - key: SMS_PROVIDER
+        sync: false
+      # Termii — provider préféré depuis 2026-06-09 (paiement MoMo CI direct)
+      - key: TERMII_API_KEY
+        sync: false
+      - key: TERMII_SENDER_ID
+        sync: false
+      # Africa's Talking — provider legacy, conservé pour fallback
       - key: AT_USERNAME
         sync: false
       - key: AT_API_KEY

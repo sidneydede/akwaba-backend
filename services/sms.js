@@ -1,22 +1,65 @@
-// services/sms.js — Envoi de SMS via Africa's Talking
-// Mode production : utilise l'API Africa's Talking si AT_USERNAME + AT_API_KEY définis
-// Mode dev : log l'OTP dans la console (visible dans Render Logs)
+// services/sms.js — Façade SMS multi-provider
+//
+// Sélectionne dynamiquement le provider SMS via SMS_PROVIDER :
+//   - 'termii'         → services/sms/termii.js
+//   - 'africastalking' → services/sms/africastalking.js
+//   - non défini       → auto-détection (premier provider configuré),
+//                        sinon mode dev (log de l'OTP).
+//
+// API publique préservée pour les consommateurs (routes/auth.js) :
+//   sendOtp(phone, code)  → { success, dev?, error? }
+//   isRealSmsEnabled()    → boolean
+//   normalizePhone(phone) → string E.164 +225XXXXXXXXXX
+//
+// Pour ajouter un nouveau provider :
+//   1. Créer services/sms/<name>.js qui exporte { name, isConfigured, sendSms }
+//   2. Ajouter une entrée dans PROVIDERS ci-dessous
+//   3. C'est tout (la façade gère le reste)
 
-var AT_USERNAME = process.env.AT_USERNAME;
-var AT_API_KEY = process.env.AT_API_KEY;
-var AT_SENDER_ID = process.env.AT_SENDER_ID || 'AKWABA';
+var africastalking = require('./sms/africastalking');
+var termii = require('./sms/termii');
 
-// URL sandbox vs production
-// Sandbox = tests gratuits (username doit être 'sandbox')
-// Production = vrais SMS payants
-var AT_URL = AT_USERNAME === 'sandbox'
-  ? 'https://api.sandbox.africastalking.com/version1/messaging'
-  : 'https://api.africastalking.com/version1/messaging';
+var PROVIDERS = {
+  africastalking: africastalking,
+  termii: termii
+};
 
-// Détecte si le mode SMS réel est actif
+// Ordre d'auto-détection si SMS_PROVIDER n'est pas défini.
+// Termii d'abord car c'est notre nouveau provider préféré (paiement MoMo CI direct).
+var AUTO_ORDER = ['termii', 'africastalking'];
+
+// Sélectionne le provider actif au boot. Re-calculé à chaque appel sendOtp
+// pour rester réactif à un changement d'env var en runtime (utile en dev).
+// @returns {object|null} L'adapter actif, ou null si aucun configuré
+function pickProvider() {
+  var name = (process.env.SMS_PROVIDER || '').toLowerCase().trim();
+
+  // Cas 1 : SMS_PROVIDER explicite
+  if (name && PROVIDERS[name]) {
+    if (PROVIDERS[name].isConfigured()) {
+      return PROVIDERS[name];
+    }
+    // Provider explicitement choisi mais mal configuré → on le retourne quand
+    // même pour que le log soit clair (au lieu de fallback silencieux).
+    console.warn('[SMS] Provider "' + name + '" sélectionné mais credentials manquants.');
+    return null;
+  }
+
+  // Cas 2 : auto-détection — premier provider configuré gagne
+  for (var i = 0; i < AUTO_ORDER.length; i++) {
+    var p = PROVIDERS[AUTO_ORDER[i]];
+    if (p && p.isConfigured()) {
+      return p;
+    }
+  }
+
+  return null;
+}
+
+// Indique si un provider réel est actif (sinon mode dev = log OTP)
 // @returns {boolean}
 function isRealSmsEnabled() {
-  return Boolean(AT_USERNAME && AT_API_KEY);
+  return pickProvider() !== null;
 }
 
 // Normalise un numéro ivoirien au format international +225XXXXXXXXXX
@@ -30,54 +73,24 @@ function normalizePhone(phone) {
   return '+225' + clean;
 }
 
-// Envoie un code OTP par SMS
+// Envoie un code OTP par SMS via le provider actif
 // @param {string} phone - Numéro destinataire
 // @param {string} code - Code OTP à 6 chiffres
-// @returns {Promise<object>} { success: boolean, dev?: boolean }
+// @returns {Promise<{success: boolean, dev?: boolean, error?: any}>}
 function sendOtp(phone, code) {
   var normalized = normalizePhone(phone);
-  var message = 'Akwaba : votre code de verification est ' + code + '. Valable 10 minutes.';
+  var message = 'EventNextDoor : votre code de verification est ' + code + '. Valable 10 minutes.';
 
-  // Mode dev : log dans la console et retourne success
-  if (!isRealSmsEnabled()) {
+  var provider = pickProvider();
+
+  // Mode dev : aucun provider configuré → log dans la console
+  if (!provider) {
     console.log('[SMS DEV] OTP pour ' + normalized + ' : ' + code);
     return Promise.resolve({ success: true, dev: true });
   }
 
-  // Mode prod : appel HTTP à Africa's Talking
-  // ⚠️ En sandbox, ne PAS envoyer le paramètre `from` : les sender IDs
-  // personnalisés ne sont pas autorisés en sandbox et le SMS est rejeté.
-  // En production, on utilise AT_SENDER_ID (doit être pré-approuvé par AT).
-  var isSandbox = AT_USERNAME === 'sandbox';
-  var formBody = 'username=' + encodeURIComponent(AT_USERNAME) +
-    '&to=' + encodeURIComponent(normalized) +
-    '&message=' + encodeURIComponent(message);
-  if (!isSandbox) {
-    formBody += '&from=' + encodeURIComponent(AT_SENDER_ID);
-  }
-
-  return fetch(AT_URL, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'apiKey': AT_API_KEY
-    },
-    body: formBody
-  })
-    .then(function(res) { return res.json(); })
-    .then(function(data) {
-      console.log('[SMS] Réponse Africa\'s Talking :', JSON.stringify(data));
-      var recipients = data && data.SMSMessageData && data.SMSMessageData.Recipients;
-      if (recipients && recipients.length > 0 && recipients[0].status === 'Success') {
-        return { success: true };
-      }
-      return { success: false, error: data };
-    })
-    .catch(function(err) {
-      console.error('[SMS] Erreur envoi :', err.message);
-      return { success: false, error: err.message };
-    });
+  console.log('[SMS] Envoi via ' + provider.name + ' → ' + normalized);
+  return provider.sendSms(normalized, message);
 }
 
 module.exports = {
