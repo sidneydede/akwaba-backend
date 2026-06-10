@@ -24,11 +24,19 @@ services:
       # Secrets renseignés dans le dashboard Render (sync: false = jamais en repo).
       # OTP SMS — REQUIS pour login/register. Multi-provider (cf. services/sms.js).
       # Sélection du provider actif (vide = auto-détection : premier configuré).
-      #   - 'termii'         → utilise TERMII_* (paiement MoMo CI direct, recommandé)
+      #   - 'hsms'           → utilise HSMS_*   (provider local CI, recommandé)
+      #   - 'termii'         → utilise TERMII_* (fallback)
       #   - 'africastalking' → utilise AT_*    (legacy, paiement carte/PayPal)
       - key: SMS_PROVIDER
         sync: false
-      # Termii — provider préféré depuis 2026-06-09 (paiement MoMo CI direct)
+      # HSMS.CI — provider préféré depuis 2026-06-10 (local CI, MoMo direct)
+      - key: HSMS_TOKEN
+        sync: false
+      - key: HSMS_CLIENTID
+        sync: false
+      - key: HSMS_CLIENTSECRET
+        sync: false
+      # Termii — fallback (paiement MoMo CI direct, sender ID en attente d'approbation)
       - key: TERMII_API_KEY
         sync: false
       - key: TERMII_SENDER_ID

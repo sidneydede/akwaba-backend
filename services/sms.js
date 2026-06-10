@@ -1,6 +1,7 @@
 // services/sms.js — Façade SMS multi-provider
 //
 // Sélectionne dynamiquement le provider SMS via SMS_PROVIDER :
+//   - 'hsms'           → services/sms/hsms.js          (préféré, local CI)
 //   - 'termii'         → services/sms/termii.js
 //   - 'africastalking' → services/sms/africastalking.js
 //   - non défini       → auto-détection (premier provider configuré),
@@ -18,15 +19,18 @@
 
 var africastalking = require('./sms/africastalking');
 var termii = require('./sms/termii');
+var hsms = require('./sms/hsms');
 
 var PROVIDERS = {
   africastalking: africastalking,
-  termii: termii
+  termii: termii,
+  hsms: hsms
 };
 
 // Ordre d'auto-détection si SMS_PROVIDER n'est pas défini.
-// Termii d'abord car c'est notre nouveau provider préféré (paiement MoMo CI direct).
-var AUTO_ORDER = ['termii', 'africastalking'];
+// HSMS en premier (provider local CI, paiement MoMo, sender ID local),
+// puis Termii (fallback), puis Africa's Talking (legacy).
+var AUTO_ORDER = ['hsms', 'termii', 'africastalking'];
 
 // Sélectionne le provider actif au boot. Re-calculé à chaque appel sendOtp
 // pour rester réactif à un changement d'env var en runtime (utile en dev).
