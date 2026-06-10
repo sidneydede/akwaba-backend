@@ -45,7 +45,9 @@ function sendSms(phoneE164, message) {
     unicode: false
   };
 
-  return fetch(HSMS_BASE_URL + '/api/envoi-sms', {
+  // Trailing slash obligatoire — sans ça Django/DRF fait un 301 vers /api/envoi-sms/
+  // et fetch dégrade le POST en GET → HSMS répond 405 "Méthode GET non autorisée".
+  return fetch(HSMS_BASE_URL + '/api/envoi-sms/', {
     method: 'POST',
     headers: {
       'Accept': 'application/json',
