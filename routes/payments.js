@@ -268,22 +268,44 @@ router.post('/paystack-notify', function(req, res) {
               console.log('Webhook Paystack : transac non success selon API:', reference, realStatus);
               return res.json({ success: true, message: 'Webhook enregistré, statut: ' + realStatus });
             }
+            // SEC C1 : avant de confirmer, vérifier que le montant réellement
+            // encaissé couvre le montant dû du booking. Sans ça, une transac
+            // 'success' forgée/réutilisée pour un faible montant rattachée à
+            // une ref connue (la ref est renvoyée au client) confirmerait un
+            // billet sous-payé. realAmount est en FCFA naturel (fromSubunit),
+            // total_amount aussi → comparables directement.
             return pool.query(
-              "UPDATE bookings SET statut = 'confirme', updated_at = NOW() " +
-              "WHERE transaction_id = $1 AND statut != 'confirme' RETURNING id",
+              "SELECT COALESCE(SUM(total_amount), 0) AS due, COUNT(*) AS n " +
+              "FROM bookings WHERE transaction_id = $1 AND statut != 'confirme'",
               [reference]
-            )
-              .then(function(updateResult) {
-                updateResult.rows.forEach(function(row) {
-                  notifyBookingConfirmed(row.id);
-                  awardReferralBonusIfEligible(row.id);
+            ).then(function(dueRes) {
+              var n = parseInt(dueRes.rows[0].n, 10);
+              if (n === 0) {
+                return res.json({ success: true, message: 'Aucun booking en attente pour cette référence' });
+              }
+              var due = Number(dueRes.rows[0].due) || 0;
+              if (realAmount < due) {
+                console.error('[paystack] SOUS-PAIEMENT détecté ref=' + reference +
+                  ' payé=' + realAmount + ' dû=' + due + ' — booking NON confirmé');
+                return res.json({ success: true, message: 'Montant insuffisant — réservation non confirmée' });
+              }
+              return pool.query(
+                "UPDATE bookings SET statut = 'confirme', updated_at = NOW() " +
+                "WHERE transaction_id = $1 AND statut != 'confirme' RETURNING id",
+                [reference]
+              )
+                .then(function(updateResult) {
+                  updateResult.rows.forEach(function(row) {
+                    notifyBookingConfirmed(row.id);
+                    awardReferralBonusIfEligible(row.id);
+                  });
+                  res.json({
+                    success: true,
+                    message: 'Paiement vérifié et réservation confirmée',
+                    bookings_confirmed: updateResult.rows.length,
+                  });
                 });
-                res.json({
-                  success: true,
-                  message: 'Paiement vérifié et réservation confirmée',
-                  bookings_confirmed: updateResult.rows.length,
-                });
-              });
+            });
           });
       })
       .catch(function(err) {

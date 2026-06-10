@@ -15,6 +15,16 @@ if (process.env.SENTRY_DSN) {
   });
 }
 
+// SEC M1 : garde-fou anti-misconfig. MOCK_PAYMENTS=true confirme les billets
+// sans débit réel (utile en test). En prod, c'est une perte de 100% du CA si
+// la var fuit — on refuse de démarrer plutôt que de vendre des billets gratuits.
+if (process.env.NODE_ENV === 'production' && process.env.MOCK_PAYMENTS === 'true') {
+  throw new Error(
+    'MOCK_PAYMENTS=true interdit en production (confirmerait des billets sans paiement). ' +
+    'Retire cette variable sur Render avant de démarrer.'
+  );
+}
+
 var express = require('express');
 var cors = require('cors');
 var helmet = require('helmet');

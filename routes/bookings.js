@@ -209,21 +209,39 @@ router.post('/', auth.authMiddleware, function(req, res) {
           // (le total events.places_restantes reste coherent pour les queries legacy).
           return pool.query(
             'UPDATE event_tickets SET places_restantes = places_restantes - $1, updated_at = NOW() ' +
-            'WHERE id = $2',
+            'WHERE id = $2 AND places_restantes >= $1 RETURNING places_restantes',
             [quantity, ticket.id]
           )
-            .then(function() {
+            .then(function(decRes) {
+              // SEC H5 : décrément atomique conditionnel. Le check
+              // places_restantes < quantity plus haut lit une valeur qui peut
+              // être périmée sous concurrence ; ici on ne décrémente QUE si le
+              // stock est encore suffisant. Si 0 ligne touchée, une réservation
+              // concurrente a pris les dernières places → on annule le booking
+              // qu'on vient d'insérer et on renvoie sold_out (anti-oversell).
+              if (decRes.rowCount === 0) {
+                return pool.query('DELETE FROM bookings WHERE id = $1', [booking.id])
+                  .then(function() {
+                    res.status(400).json({
+                      success: false,
+                      code: 'sold_out',
+                      message: 'Plus assez de places dans la catégorie « ' + ticket.name + ' ».',
+                    });
+                    return null;
+                  });
+              }
               return pool.query(
                 'UPDATE events SET places_restantes = places_restantes - $1 WHERE id = $2',
                 [quantity, eventId]
-              );
-            })
-            .then(function() {
-              // Récupère les infos user pour le checkout Paystack (email
-              // obligatoire côté Paystack, fallback placeholder si absent).
-              return pool.query('SELECT id, nom, prenom, phone, email FROM users WHERE id = $1', [req.userId]);
+              )
+                .then(function() {
+                  // Récupère les infos user pour le checkout Paystack (email
+                  // obligatoire côté Paystack, fallback placeholder si absent).
+                  return pool.query('SELECT id, nom, prenom, phone, email FROM users WHERE id = $1', [req.userId]);
+                });
             })
             .then(function(userResult) {
+              if (userResult === null) return null; // sold_out déjà répondu — court-circuit
               var user = userResult.rows[0] || {};
 
               // Mode MOCK_PAYMENTS=true : on bypass CinetPay et on confirme direct.
@@ -438,6 +456,11 @@ router.post('/check-in', auth.authMiddleware, function(req, res) {
   var ref;
 
   // Nouveau format signé (obligatoire à terme).
+  // SEC H1 : on n'accepte QUE le payload signé HMAC. Le fallback « ref nue »
+  // a été retiré — il permettait de valider un billet à partir d'une simple
+  // référence (32 bits, exposée partout), contournant toute la garantie de
+  // signature. Le check-in manuel (QR illisible) passe désormais par un
+  // payload signé renvoyé par /bookings/lookup.
   if (req.body.payload) {
     var verified = qr.parseAndVerify(req.body.payload);
     if (!verified.ok) {
@@ -448,16 +471,6 @@ router.post('/check-in', auth.authMiddleware, function(req, res) {
       });
     }
     ref = verified.ref;
-  } else if (req.body.ref) {
-    // Compat temporaire pour billets pré-signature (à retirer après 30j de prod).
-    ref = req.body.ref;
-    if (typeof ref !== 'string' || !/^AKW-[A-F0-9]{8}$/.test(ref)) {
-      return res.status(400).json({
-        success: false,
-        code: 'INVALID_REF',
-        message: 'Référence de billet invalide. Format attendu : AKW-XXXXXXXX.'
-      });
-    }
   } else {
     return res.status(400).json({
       success: false,
@@ -587,16 +600,17 @@ router.post('/check-in-batch', auth.authMiddleware, function(req, res) {
   // { ref, ok, code, message }. Pas de reject (les erreurs sont des items).
   function processOne(item) {
     var ref;
+    // SEC H1 : payload signé obligatoire (plus de fallback ref nue). Les scans
+    // offline (caméra) et les check-in manuels offline stockent désormais le
+    // payload signé en queue, donc cette voie reste fonctionnelle.
     if (item.payload) {
       var verified = qr.parseAndVerify(item.payload);
       if (!verified.ok) {
         return Promise.resolve({ ref: null, ok: false, code: 'INVALID_SIGNATURE', message: 'QR falsifie' });
       }
       ref = verified.ref;
-    } else if (item.ref && /^AKW-[A-F0-9]{8}$/.test(item.ref)) {
-      ref = item.ref;
     } else {
-      return Promise.resolve({ ref: item.ref || null, ok: false, code: 'INVALID_REF', message: 'Ref invalide' });
+      return Promise.resolve({ ref: item.ref || null, ok: false, code: 'MISSING_PAYLOAD', message: 'Signature requise' });
     }
 
     function processStatus(b) {
@@ -708,6 +722,11 @@ router.post('/lookup', auth.authMiddleware, function(req, res) {
         return {
           id: r.id,
           ref: r.ref,
+          // SEC H1 : on renvoie un payload signé côté serveur pour que le
+          // check-in manuel (QR illisible) utilise /check-in avec une
+          // signature valide, au lieu d'une ref nue. La signature ne fuit
+          // rien (le scope est déjà limité aux events de l'orga/staff).
+          payload: qr.signRef(r.ref),
           quantity: r.quantity,
           statut: r.statut,
           utilise_at: r.utilise_at,
@@ -775,8 +794,12 @@ router.post('/:id/cancel', auth.authMiddleware, function(req, res) {
         // Calcul du ratio selon le délai avant l'événement.
         var ratio;
         if (!b.start_at) {
-          // Pas de date parsable : on est généreux (100%).
-          ratio = 1.0;
+          // SEC M5 : pas de date parsable → on applique la politique la PLUS
+          // prudente (less_than_24h, typiquement 0%) plutôt que 100%. Un event
+          // sans start_at (bug d'édition orga, legacy) ne doit pas ouvrir un
+          // refund intégral même à la dernière minute. Le cas est journalisé
+          // côté userAudit ci-dessous ; un admin peut surclasser manuellement.
+          ratio = parseFloat(policy.less_than_24h);
         } else {
           var hoursUntil = (new Date(b.start_at).getTime() - Date.now()) / 3600000;
           if (hoursUntil > 48) ratio = parseFloat(policy.more_than_48h);

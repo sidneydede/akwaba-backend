@@ -52,6 +52,16 @@ function reconcileOne(b) {
       // Paystack confirme : on transite vers 'confirme' (idempotent — autre process
       // pourrait avoir déjà confirmé via le webhook entre-temps, on accepte).
       if (status === 'success') {
+        // SEC C1 : ne confirmer que si le montant encaissé couvre le dû.
+        // Même garde que le webhook charge.success (anti sous-paiement).
+        // check.amount et b.total_amount sont tous deux en FCFA naturel.
+        var paid = check.amount || 0;
+        var due = Number(b.total_amount) || 0;
+        if (paid < due) {
+          console.error('[reconcile] SOUS-PAIEMENT ref=' + b.ref +
+            ' payé=' + paid + ' dû=' + due + ' — non confirmé');
+          return 'underpaid';
+        }
         return pool.query(
           "UPDATE bookings SET statut = 'confirme', updated_at = NOW() " +
           "WHERE id = $1 AND statut = 'en_attente' RETURNING id",

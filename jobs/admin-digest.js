@@ -135,6 +135,20 @@ function formatFCFA(n) {
   return new Intl.NumberFormat('fr-FR').format(n || 0) + ' FCFA';
 }
 
+// SEC H2 : échappe le contenu contrôlé par l'organisateur (titre/emoji d'event)
+// avant insertion dans le HTML du digest. Sans ça, un titre d'event du type
+// <img src=x onerror=...> s'exécute dans la session admin (GET /admin/digest/latest
+// rendu en preview) ET dans l'email envoyé à tous les admins.
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function renderHTML(d, baseUrl) {
   var b = baseUrl || 'https://akwaba-admin.vercel.app';
   var date = new Date(d.digest_date).toLocaleDateString('fr-FR', {
@@ -150,7 +164,7 @@ function renderHTML(d, baseUrl) {
     d.anomalies_refund.forEach(function(a) {
       anomaliesHtml +=
         '<tr><td style="padding:8px 0;border-bottom:1px solid #E5DDD0;font-size:14px">' +
-        (a.emoji || '🎵') + ' <strong>' + a.title + '</strong></td>' +
+        escapeHtml(a.emoji || '🎵') + ' <strong>' + escapeHtml(a.title) + '</strong></td>' +
         '<td style="padding:8px 0;border-bottom:1px solid #E5DDD0;text-align:right;font-size:13px;color:#A8431F">' +
         a.refund_rate + '% (' + a.refunds_count + '/' + a.bookings_count + ')</td></tr>';
     });
@@ -164,7 +178,7 @@ function renderHTML(d, baseUrl) {
       topHtml +=
         '<tr><td style="padding:8px 0;border-bottom:1px solid #E5DDD0;font-size:14px">' +
         '<strong style="color:#D85A2C;font-family:Georgia,serif">' + (i + 1) + '.</strong> ' +
-        (e.emoji || '🎵') + ' ' + e.title + '</td>' +
+        escapeHtml(e.emoji || '🎵') + ' ' + escapeHtml(e.title) + '</td>' +
         '<td style="padding:8px 0;border-bottom:1px solid #E5DDD0;text-align:right;font-size:13px;color:#666">' +
         e.bookings_count + ' billets · ' + formatFCFA(e.revenue) + '</td></tr>';
     });

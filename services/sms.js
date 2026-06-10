@@ -83,8 +83,16 @@ function sendOtp(phone, code) {
 
   var provider = pickProvider();
 
-  // Mode dev : aucun provider configuré → log dans la console
+  // Mode dev : aucun provider configuré → log dans la console.
+  // SEC H3 : SAUF en prod. Si aucun provider SMS n'est résolu en production
+  // (var d'env manquante/mal nommée, solde épuisé), le mode dev mettrait le
+  // code OTP en clair dans la réponse HTTP (dev_otp) → prise de contrôle de
+  // n'importe quel compte. On refuse explicitement (parité avec email.js).
   if (!provider) {
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[SMS] Aucun provider SMS configuré en prod — refus envoi pour ' + normalized);
+      return Promise.resolve({ success: false, error: 'SMS_NOT_CONFIGURED' });
+    }
     console.log('[SMS DEV] OTP pour ' + normalized + ' : ' + code);
     return Promise.resolve({ success: true, dev: true });
   }
