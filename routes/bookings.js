@@ -482,7 +482,7 @@ router.post('/check-in', auth.authMiddleware, function(req, res) {
   // 1) Lookup billet + event + participant en une seule requête
   var b;
   pool.query(
-    'SELECT b.id, b.statut, b.quantity, b.utilise_at, ' +
+    'SELECT b.id, b.user_id, b.statut, b.quantity, b.utilise_at, ' +
     'e.id AS event_id, e.organizer_id, e.title AS event_title, ' +
     'u.nom, u.prenom ' +
     'FROM bookings b ' +
@@ -553,6 +553,22 @@ router.post('/check-in', auth.authMiddleware, function(req, res) {
           message: 'Billet scanné juste à l\'instant par un autre scan.'
         });
       }
+      // CHECKIN-PUSH-01 : notif au participant que son billet a ete valide.
+      // Fire-and-forget — ne bloque pas la reponse HTTP au scanner orga.
+      // data.refresh signale au front qu'il faut recharger MesBillets (le
+      // billet doit passer de "A venir" a "Passes" via le bucketOf statut).
+      push.notifyUser(b.user_id, {
+        title: 'Bienvenue !',
+        body: 'Ton billet pour ' + b.event_title + ' vient d\'etre valide. Profite bien.',
+        data: {
+          type: 'booking_checked_in',
+          booking_ref: ref,
+          event_id: b.event_id,
+          refresh: 'tickets'
+        }
+      }).catch(function(err) {
+        console.error('Erreur notif check-in:', err && err.message);
+      });
       res.json({
         success: true,
         checkin: {
@@ -635,12 +651,27 @@ router.post('/check-in-batch', auth.authMiddleware, function(req, res) {
         if (upd.rowCount === 0) {
           return { ref: ref, ok: true, code: 'ALREADY_USED' };
         }
+        // CHECKIN-PUSH-01 (batch) : meme notif que /check-in single. Fire-and-
+        // forget, ne bloque pas la reponse batch. b.user_id + b.event_title
+        // requierent un SELECT etendu (cf. query plus haut).
+        push.notifyUser(b.user_id, {
+          title: 'Bienvenue !',
+          body: 'Ton billet pour ' + b.event_title + ' vient d\'etre valide. Profite bien.',
+          data: {
+            type: 'booking_checked_in',
+            booking_ref: ref,
+            event_id: b.event_id,
+            refresh: 'tickets'
+          }
+        }).catch(function(err) {
+          console.error('Erreur notif check-in batch:', err && err.message);
+        });
         return { ref: ref, ok: true, utilise_at: upd.rows[0].utilise_at };
       });
     }
 
     return pool.query(
-      'SELECT b.id, b.statut, b.utilise_at, b.event_id, e.organizer_id ' +
+      'SELECT b.id, b.user_id, b.statut, b.utilise_at, b.event_id, e.organizer_id, e.title AS event_title ' +
       'FROM bookings b JOIN events e ON b.event_id = e.id WHERE b.ref = $1',
       [ref]
     ).then(function(result) {
